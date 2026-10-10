@@ -1,0 +1,49 @@
+# Cross-SDK compatibility check: Postgres plus the official Python SDK.
+# Driven by cross-sdk/run.sh (bb cross-sdk-test).
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: absurd
+      POSTGRES_PASSWORD: absurd
+      POSTGRES_DB: absurd
+    ports:
+      - "127.0.0.1::5432"
+    volumes:
+      - ../test/resources/absurd.sql:/docker-entrypoint-initdb.d/01-absurd.sql:ro
+      - ./init/02-queues.sql:/docker-entrypoint-initdb.d/02-queues.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U absurd -d absurd"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  python-worker:
+    image: python:3.12-slim
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ABSURD_DATABASE_URL: postgresql://absurd:absurd@postgres:5432/absurd
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    volumes:
+      - ./python:/app:ro
+      - pip-cache:/root/.cache/pip
+    command: sh -c "pip install --quiet absurd-sdk==0.5.0 && python /app/worker.py"
+
+  python-client:
+    image: python:3.12-slim
+    profiles: [client]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ABSURD_DATABASE_URL: postgresql://absurd:absurd@postgres:5432/absurd
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    volumes:
+      - ./python:/app:ro
+      - pip-cache:/root/.cache/pip
+    command: sh -c "pip install --quiet absurd-sdk==0.5.0 && python /app/client.py"
+
+volumes:
+  pip-cache:

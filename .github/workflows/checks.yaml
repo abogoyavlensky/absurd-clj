@@ -10,11 +10,11 @@ jobs:
   lint-fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/cache-clojure-deps
         with:
           key-label: 'lint'
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v5
         with:
           install_args: "babashka cljfmt clj-kondo java clojure"
       - name: Lint and format
@@ -23,11 +23,11 @@ jobs:
   outdated:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/cache-clojure-deps
         with:
           key-label: 'outdated'
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v5
         with:
           install_args: "babashka java clojure"
       - name: Check outdated deps
@@ -36,12 +36,28 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/cache-clojure-deps
         with:
           key-label: 'tests'
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v5
         with:
           install_args: "babashka java clojure"
       - name: Run tests
         run: bb test
+      - name: Compile examples
+        run: bb example-check
+
+  cross-sdk:
+    runs-on: ubuntu-latest
+    needs: [ tests ]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/cache-clojure-deps
+        with:
+          key-label: 'cross-sdk'
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: "babashka java clojure"
+      - name: Cross-SDK compatibility check
+        run: bb cross-sdk-test

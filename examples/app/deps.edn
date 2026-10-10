@@ -1,0 +1,7 @@
+{:deps {io.github.abogoyavlensky/absurd-clj {:local/root "../.."}
+        integrant/integrant {:mvn/version "1.0.1"}
+        aero/aero {:mvn/version "1.1.6"}
+        com.zaxxer/HikariCP {:mvn/version "6.3.0"}
+        ch.qos.logback/logback-classic {:mvn/version "1.6.5"}}
+ :paths ["src" "resources"]
+ :aliases {:run {:main-opts ["-m" "app.main"]}}}
