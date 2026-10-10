@@ -1,0 +1,14 @@
+;; Integrant system, read with aero so values can come from the environment.
+{:app/db {:jdbc-url #or [#env APP_JDBC_URL
+                         "jdbc:postgresql://localhost:5433/absurd?user=absurd&password=absurd"]
+          :maximum-pool-size 6}
+
+ :app/absurd {:db #ig/ref :app/db
+              :queue #or [#env APP_QUEUE "default"]
+              :max-attempts 5}
+
+ :app/worker {:absurd #ig/ref :app/absurd
+              :worker-id #env APP_WORKER_ID
+              :concurrency 4
+              :claim-timeout 120
+              :poll-interval 250}}
