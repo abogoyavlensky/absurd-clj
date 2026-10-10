@@ -1,0 +1,32 @@
+# Local stack for the examples: Postgres with the Absurd schema and a
+# "default" queue, plus the Habitat dashboard on http://localhost:7890.
+#
+#   cd examples && docker compose up -d --build
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: absurd
+      POSTGRES_PASSWORD: absurd
+      POSTGRES_DB: absurd
+    ports:
+      - "${ABSURD_PG_PORT:-5433}:5432"
+    volumes:
+      - ../test/resources/absurd.sql:/docker-entrypoint-initdb.d/01-absurd.sql:ro
+      - ./init/02-default-queue.sql:/docker-entrypoint-initdb.d/02-default-queue.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U absurd -d absurd"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  habitat:
+    build: ./habitat
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      HABITAT_DB_URL: postgres://absurd:absurd@postgres:5432/absurd?sslmode=disable
+      HABITAT_LISTEN: ":7890"
+    ports:
+      - "${HABITAT_PORT:-7890}:7890"

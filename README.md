@@ -252,6 +252,12 @@ All SDK errors are `ex-info` with a `:type` key:
 
 Database errors from the driver propagate unchanged.
 
+## Try it
+
+`examples/` has a quickstart (a worker and a client, two scripts) and a small
+application wired with Integrant, both running against a compose stack with
+Postgres and the Habitat dashboard. See [examples/README.md](examples/README.md).
+
 ## Development
 
 Install Java, Clojure and Babashka manually or via [mise](https://mise.jdx.dev/):

@@ -1,0 +1,6 @@
+{:deps {io.github.abogoyavlensky/absurd-clj {:local/root "../.."}
+        ch.qos.logback/logback-classic {:mvn/version "1.6.5"}}
+ :paths ["src" "resources"]
+ :aliases {:worker {:main-opts ["-m" "quickstart.worker"]}
+           :client {:main-opts ["-m" "quickstart.client"]}
+           :emit {:main-opts ["-m" "quickstart.emit"]}}}

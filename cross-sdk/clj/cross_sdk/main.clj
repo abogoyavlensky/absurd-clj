@@ -15,7 +15,10 @@
                                (let [step (absurd/step ctx "step" (fn [] {:seen params}))]
                                  (absurd/sleep-for ctx "nap" 1)
                                  (let [go (absurd/await-event ctx (str "go:" (:task-id ctx)) {:timeout 60})]
-                                   {:from "clojure" :params params :step step :go go})))
+                                   {:from "clojure"
+                                    :params params
+                                    :step step
+                                    :go go})))
                              {:max-attempts 1})
       (absurd/register-task! "wait-done"
                              (fn [_ ctx] (absurd/await-event ctx "xsdk:done" {:timeout 180}))
@@ -23,13 +26,16 @@
 
 (defn- forward-check!
   [app]
-  (let [spawned (absurd/spawn! app "py-echo" {:n 1 :who "clojure"} {:queue "xsdk_py"})]
+  (let [spawned (absurd/spawn! app "py-echo" {:n 1
+                                              :who "clojure"} {:queue "xsdk_py"})]
     (absurd/emit-event! app (str "go:" (:task-id spawned)) {:ok true} {:queue "xsdk_py"})
-    (let [result (absurd/await-task-result app (:task-id spawned) {:queue "xsdk_py" :timeout 90})]
+    (let [result (absurd/await-task-result app (:task-id spawned) {:queue "xsdk_py"
+                                                                   :timeout 90})]
       (println "clojure->python:" (:state result) (pr-str (:result result)))
       (and (= :completed (:state result))
            (= "python" (get-in result [:result :from]))
-           (= {:n 1 :who "clojure"} (get-in result [:result :params]))
+           (= {:n 1
+               :who "clojure"} (get-in result [:result :params]))
            (= {:ok true} (get-in result [:result :go]))))))
 
 (defn- reverse-check!
@@ -42,7 +48,8 @@
 
 (defn -main
   [& _]
-  (let [app (absurd/client {:db (System/getenv "ABSURD_DATABASE_URL") :queue "xsdk_clj"})
+  (let [app (absurd/client {:db (System/getenv "ABSURD_DATABASE_URL")
+                            :queue "xsdk_clj"})
         _ (register-tasks! app)
         ok? (with-open [_ (absurd/start-worker! app {:worker-id "clj-worker"
                                                      :claim-timeout 30
