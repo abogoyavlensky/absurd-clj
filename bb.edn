@@ -40,6 +40,9 @@
                        (spit target (:body (http/get url)))
                        (println "Vendored" url "->" target))}
 
+  cross-sdk-test {:doc "Run the cross-SDK compatibility check against the Python SDK (needs Docker)"
+                  :task (shell "bash" "cross-sdk/run.sh")}
+
   install-snapshot {:doc "Install version locally"
                     :task (clojure "-T:build install :snapshot true")}
 
