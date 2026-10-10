@@ -29,6 +29,17 @@
   check {:doc "Run all code checks and tests"
          :depends [fmt lint outdated test]}
 
+  sync-schema {:doc "Vendor sql/absurd.sql from an upstream tag (default 0.5.0) into test/resources"
+               :requires ([babashka.http-client :as http]
+                          [clojure.java.io :as io])
+               :task (let [tag (or (first *command-line-args*) "0.5.0")
+                           url (str "https://raw.githubusercontent.com/earendil-works/absurd/"
+                                    tag "/sql/absurd.sql")
+                           target "test/resources/absurd.sql"]
+                       (io/make-parents target)
+                       (spit target (:body (http/get url)))
+                       (println "Vendored" url "->" target))}
+
   install-snapshot {:doc "Install version locally"
                     :task (clojure "-T:build install :snapshot true")}
 

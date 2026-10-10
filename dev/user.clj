@@ -15,7 +15,7 @@
   "Run all tests."
   []
   (reset)
-  (test/run-all-tests #"absurd-clj.*-test"))
+  (test/run-all-tests #"absurd\..*-test"))
 
 (comment
   ; Manage the system
