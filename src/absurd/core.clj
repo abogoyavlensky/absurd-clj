@@ -10,11 +10,17 @@
             [clojure.string :as str]
             [clojure.tools.logging :as log]
             [next.jdbc :as jdbc])
-  (:import [java.net URI URLEncoder]
+  (:import [clojure.lang IDeref]
+           [java.io Closeable]
+           [java.lang ProcessHandle]
+           [java.net InetAddress URI URLEncoder]
            [java.nio.charset StandardCharsets]
            [java.sql Connection]
            [java.time Instant OffsetDateTime]
            [java.util Date]
+           [java.util.concurrent CountDownLatch ExecutorService Executors ScheduledExecutorService
+            ScheduledFuture Semaphore ThreadFactory TimeUnit]
+           [java.util.concurrent.locks ReentrantLock]
            [javax.sql DataSource]))
 
 (def ^:private max-queue-name-bytes 57)
@@ -637,15 +643,74 @@
                                        task-id timeout maybe-heartbeat! (/ interval-ms 2)))))]
       (snapshot<-json (step ctx (or step-name (str "$awaitTaskResult:" task-id)) wait)))))
 
-;; Lease watchdog (no-ops until a worker attaches a lease)
+;; Lease watchdog
+
+(defn- daemon-thread-factory
+  ^ThreadFactory [prefix]
+  (let [counter (atom 0)]
+    (reify ThreadFactory
+      (newThread [_ runnable]
+        (doto (Thread. ^Runnable runnable (str prefix "-" (swap! counter inc)))
+          (.setDaemon true))))))
+
+(defonce ^:private watchdog-scheduler
+  (delay (Executors/newSingleThreadScheduledExecutor (daemon-thread-factory "absurd-watchdog"))))
+
+(defmacro ^:private with-lock
+  "Run `body` while holding `lock` (a ReentrantLock); `locking` is avoided
+  because coverage tooling cannot instrument monitor-enter."
+  [lock & body]
+  `(let [^ReentrantLock lock# ~lock]
+     (.lock lock#)
+     (try
+       ~@body
+       (finally
+         (.unlock lock#)))))
+
+(defn- new-lease
+  []
+  (atom {:epoch 0
+         :stopped? false
+         :scheduled nil
+         :lock (ReentrantLock.)}))
+
+(defn- lease-expired!
+  [ctx seconds]
+  (log/warnf "task %s (%s) exceeded claim timeout of %ss" (:task-name ctx) (:task-id ctx) seconds)
+  (when-let [hook (get-in (::client ctx) [:hooks :on-lease-timeout])]
+    (try
+      (hook ctx seconds)
+      (catch Throwable t
+        (log/warn t "on-lease-timeout hook failed")))))
 
 (defn- lease-touch!
-  [_ctx _seconds]
-  nil)
+  "(Re)schedule the watchdog to fire `seconds` from now. Stale callbacks
+  from earlier schedules are ignored through the epoch."
+  [ctx seconds]
+  (when-let [lease (::lease ctx)]
+    (when (pos? seconds)
+      (with-lock (:lock @lease)
+        (let [{:keys [stopped? ^ScheduledFuture scheduled]} @lease]
+          (when-not stopped?
+            (some-> scheduled (.cancel false))
+            (let [epoch (:epoch (swap! lease update :epoch inc))
+                  callback (fn []
+                             (let [current @lease]
+                               (when (and (not (:stopped? current)) (= epoch (:epoch current)))
+                                 (lease-expired! ctx seconds))))
+                  scheduled (.schedule ^ScheduledExecutorService @watchdog-scheduler
+                                       ^Runnable callback
+                                       (long (* 1000 seconds))
+                                       TimeUnit/MILLISECONDS)]
+              (swap! lease assoc :scheduled scheduled))))))))
 
 (defn- lease-stop!
-  [_lease]
-  nil)
+  [lease]
+  (when lease
+    (with-lock (:lock @lease)
+      (let [{:keys [^ScheduledFuture scheduled]} @lease]
+        (some-> scheduled (.cancel false))
+        (swap! lease assoc :stopped? true :scheduled nil :epoch (inc (:epoch @lease)))))))
 
 ;; Execution
 
@@ -700,6 +765,7 @@
   (let [ctx (make-context app claim claim-timeout lease)
         execute #((:handler registration) (:params claim) ctx)
         wrap (get-in app [:hooks :wrap-task-execution])]
+    (lease-touch! ctx claim-timeout)
     (binding [*context* ctx]
       (if wrap
         (wrap ctx execute)
@@ -749,8 +815,128 @@
      (execute-task! app claim claim-timeout nil))
    nil))
 
-;; Placeholders completed in later tasks
+;; Worker
+
+(defprotocol ^:private WorkerControl
+  (-stop! [worker]))
+
+(defn- default-worker-id
+  []
+  (str (.getHostName (InetAddress/getLocalHost)) ":" (.pid (ProcessHandle/current))))
+
+(defn- pause
+  "Wait up to `ms` milliseconds, returning early once `stop-latch` is released."
+  [^CountDownLatch stop-latch ms]
+  (.await stop-latch (long ms) TimeUnit/MILLISECONDS))
+
+(defn- run-claimed!
+  [app claim claim-timeout ^Semaphore capacity]
+  (try
+    (execute-task! app claim claim-timeout (new-lease))
+    (catch Throwable t
+      (log/error t "unexpected error while executing task" (:task-name claim)))
+    (finally
+      (.release capacity))))
+
+(defn- worker-loop
+  [app state ^CountDownLatch stop-latch ^Semaphore capacity ^ExecutorService executor]
+  (let [{:keys [worker-id claim-timeout batch-size poll-interval]} @state]
+    (while (:running? @state)
+      (let [available (.availablePermits capacity)]
+        (if (zero? available)
+          (pause stop-latch poll-interval)
+          (let [claims (try
+                         (claim-tasks! app {:batch-size (min batch-size available)
+                                            :claim-timeout claim-timeout
+                                            :worker-id worker-id})
+                         (catch Throwable t
+                           (log/warn t "worker failed to claim tasks")
+                           ::error))]
+            (if (or (= ::error claims) (empty? claims))
+              (pause stop-latch poll-interval)
+              ;; Claimed tasks are always dispatched, even when a stop is in
+              ;; progress, so leased work is never stranded.
+              (doseq [claim claims]
+                (.acquireUninterruptibly capacity)
+                (.execute executor ^Runnable #(run-claimed! app claim claim-timeout capacity))))))))))
 
 (defn stop-worker!
-  [_worker]
-  nil)
+  "Stop claiming, wait for in-flight tasks (bounded by `:shutdown-timeout`)
+  and shut the pool down. Returns true when every task finished, false when
+  the timeout expired with tasks still running. Calling it again is a no-op
+  that returns the first result."
+  [worker]
+  (-stop! worker))
+
+(defn start-worker!
+  "Start a polling worker on a background thread and return its handle.
+  The handle is `Closeable` (close = `stop-worker!`) and `deref`-able for a
+  status map (`:worker-id`, `:running?`, `:concurrency`, `:queue`).
+
+  A client runs at most one worker at a time; starting a second one throws
+  `:absurd/worker-already-running`.
+
+  Options: `:worker-id` (hostname:pid), `:claim-timeout` seconds (120),
+  `:concurrency` (1), `:batch-size` (= concurrency), `:poll-interval` ms (250),
+  `:shutdown-timeout` seconds (60)."
+  ([app] (start-worker! app {}))
+  ([app {:keys [worker-id claim-timeout concurrency batch-size poll-interval shutdown-timeout]
+         :or {claim-timeout 120
+              concurrency 1
+              poll-interval 250
+              shutdown-timeout 60}}]
+   (let [worker-id (or worker-id (default-worker-id))
+         concurrency (max 1 (long concurrency))
+         capacity (Semaphore. concurrency)
+         executor (Executors/newFixedThreadPool concurrency (daemon-thread-factory "absurd-task"))
+         state (atom {:worker-id worker-id
+                      :queue (:queue app)
+                      :concurrency concurrency
+                      :running? true
+                      :claim-timeout claim-timeout
+                      :batch-size (or batch-size concurrency)
+                      :poll-interval poll-interval})
+         handle-ref (atom nil)
+         stop-lock (ReentrantLock.)
+         stop-latch (CountDownLatch. 1)
+         thread (Thread. ^Runnable #(worker-loop app state stop-latch capacity executor)
+                         (str "absurd-worker-" worker-id))
+         stop! (fn []
+                 (with-lock stop-lock
+                   (if (contains? @state :drained?)
+                     (:drained? @state)
+                     (let [deadline (+ (System/nanoTime) (long (* 1e9 shutdown-timeout)))
+                           remaining-ms #(max 0 (quot (- deadline (System/nanoTime)) 1000000))]
+                       (swap! state assoc :running? false)
+                       ;; Wake the loop from its poll wait; a claim in flight finishes
+                       ;; and dispatches first. join(0) would block forever, so skip it
+                       ;; once the budget is gone.
+                       (.countDown stop-latch)
+                       (let [budget (remaining-ms)]
+                         (when (pos? budget)
+                           (.join thread (long budget))))
+                       (.shutdown executor)
+                       (let [drained? (and (not (.isAlive thread))
+                                           (.awaitTermination executor (long (remaining-ms))
+                                                              TimeUnit/MILLISECONDS))]
+                         (when-not drained?
+                           (log/warnf "worker %s stopped with %d task(s) still running"
+                                      worker-id (- concurrency (.availablePermits capacity))))
+                         (swap! state assoc :drained? drained?)
+                         (compare-and-set! (:worker app) @handle-ref nil)
+                         drained?)))))
+         handle (reify
+                  WorkerControl
+                  (-stop! [_] (stop!))
+                  IDeref
+                  (deref [_] @state)
+                  Closeable
+                  (close [_] (stop!) nil))]
+     (reset! handle-ref handle)
+     (when-not (compare-and-set! (:worker app) nil handle)
+       (.shutdown executor)
+       (fail "a worker is already running on this client; stop it first"
+             :absurd/worker-already-running {:worker-id (:worker-id @@(:worker app))}))
+     (.setDaemon thread true)
+     (.start thread)
+     handle)))
