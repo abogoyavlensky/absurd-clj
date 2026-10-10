@@ -13,7 +13,8 @@
   (:import [java.net URI URLEncoder]
            [java.nio.charset StandardCharsets]
            [java.sql Connection]
-           [java.time Instant]
+           [java.time Instant OffsetDateTime]
+           [java.util Date]
            [javax.sql DataSource]))
 
 (def ^:private max-queue-name-bytes 57)
@@ -257,8 +258,9 @@
 
 (defn- poll-task-result
   "Poll `fetch` until it returns a terminal snapshot. Delay starts at 50 ms
-  and doubles up to 1 s. `timeout` is in seconds; nil waits forever."
-  [fetch task-id timeout on-before-sleep]
+  and doubles up to 1 s, capped by `max-sleep-ms` when given. `timeout` is
+  in seconds; nil waits forever. `on-before-sleep` runs before each pause."
+  [fetch task-id timeout on-before-sleep max-sleep-ms]
   (let [timeout-ms (some-> timeout (max 0) (* 1000.0))
         started (System/nanoTime)]
     (loop [delay-ms 50.0]
@@ -278,7 +280,8 @@
                                (fail (str "Timed out waiting for task \"" task-id "\"")
                                      :absurd/timeout {:task-id task-id}))
                              (min delay-ms remaining-ms))
-                           delay-ms)]
+                           delay-ms)
+                sleep-ms (if max-sleep-ms (min sleep-ms max-sleep-ms) sleep-ms)]
             (when on-before-sleep
               (on-before-sleep))
             (Thread/sleep (long (max sleep-ms 0)))
@@ -302,7 +305,7 @@
   ([x task-id {:keys [queue timeout]
                :as opts}]
    (if (client? x)
-     (poll-task-result #(fetch-task-result x task-id {:queue queue}) task-id timeout nil)
+     (poll-task-result #(fetch-task-result x task-id {:queue queue}) task-id timeout nil nil)
      (context-await-task-result x task-id opts))))
 
 ;; Events, cancellation, retries
@@ -511,9 +514,128 @@
   [ctx event-name payload]
   (sql/emit-event! (ctx-db ctx) (:queue ctx) event-name payload))
 
+;; Sleeping
+
+(defn- suspend!
+  []
+  (throw (ex-info "task suspended" {:type :absurd/suspend})))
+
+(defn- now
+  ^Instant [ctx]
+  ((:now-fn (::client ctx))))
+
+(defn- parse-instant
+  ^Instant [^String s]
+  (.toInstant (OffsetDateTime/parse s)))
+
+(defn- ->instant
+  ^Instant [wake-at]
+  (cond
+    (instance? Instant wake-at) wake-at
+    (instance? Date wake-at) (.toInstant ^Date wake-at)
+    (number? wake-at) (Instant/ofEpochMilli (long (* 1000 wake-at)))
+    (string? wake-at) (parse-instant wake-at)
+    :else (fail "wake-at must be an Instant, Date, epoch seconds or ISO-8601 string"
+                :absurd/invalid-wake-at {:wake-at wake-at})))
+
+(defn sleep-until
+  "Suspend the task until `wake-at` (an Instant, Date, epoch seconds or ISO
+  string). The wake time is checkpointed under `step-name`, so a replay keeps
+  the original wake time. Returns nil once the wake time has passed."
+  [ctx step-name wake-at]
+  (let [wake-at (->instant wake-at)
+        checkpoint-name (checkpoint-name! ctx step-name)
+        state (lookup-checkpoint ctx checkpoint-name)
+        actual-wake-at (cond
+                         (identical? state not-found)
+                         (do (persist-checkpoint! ctx checkpoint-name (str wake-at))
+                             wake-at)
+
+                         (string? state) (parse-instant state)
+                         :else wake-at)
+        remaining-seconds (/ (- (.toEpochMilli actual-wake-at) (.toEpochMilli (now ctx))) 1000.0)]
+    (when (pos? remaining-seconds)
+      (sql/schedule-run-after! (ctx-db ctx) (:queue ctx) (:run-id ctx) remaining-seconds)
+      (suspend!))
+    nil))
+
+(defn sleep-for
+  "Suspend the task for `seconds`, checkpointed under `step-name`."
+  [ctx step-name seconds]
+  (sleep-until ctx step-name (.plusMillis (now ctx) (long (* 1000 seconds)))))
+
+;; Events
+
+(defn await-event
+  "Suspend until `event-name` is emitted and return its payload. Options:
+  `:timeout` seconds (throws `:absurd/timeout` once it expires; negative
+  values behave like 0) and `:step-name` (default `$awaitEvent:<event-name>`)."
+  ([ctx event-name] (await-event ctx event-name {}))
+  ([ctx event-name {:keys [timeout step-name]}]
+   (validate-event-name event-name)
+   (let [checkpoint-name (checkpoint-name! ctx (or step-name (str "$awaitEvent:" event-name)))
+         cached (lookup-checkpoint ctx checkpoint-name)]
+     (if-not (identical? cached not-found)
+       cached
+       (let [{:keys [event payload]} @(::wake-event ctx)]
+         (if (and (= event event-name) (nil? payload))
+           (do (reset! (::wake-event ctx) {:event nil
+                                           :payload nil})
+               (fail (str "Timed out waiting for event \"" event-name "\"")
+                     :absurd/timeout {:event-name event-name}))
+           (let [{:keys [should-suspend payload]}
+                 (sql/await-event (ctx-db ctx) (:queue ctx) (:task-id ctx) (:run-id ctx)
+                                  checkpoint-name event-name (some-> timeout (max 0)))]
+             (when should-suspend
+               (suspend!))
+             (swap! (::checkpoints ctx) assoc checkpoint-name payload)
+             (swap! (::wake-event ctx) assoc :payload nil)
+             payload)))))))
+
+;; Durable task-result waits
+
+(defn- snapshot->json
+  [{:keys [state result failure]}]
+  (case state
+    :completed {:state (name state)
+                :result result}
+    :failed {:state (name state)
+             :failure failure}
+    {:state (name state)}))
+
+(defn- snapshot<-json
+  [{:keys [state result failure]}]
+  (let [state (keyword state)]
+    (case state
+      :completed {:state state
+                  :result result}
+      :failed {:state state
+               :failure failure}
+      {:state state})))
+
 (defn- context-await-task-result
-  [_ctx _task-id _opts]
-  (fail "await-task-result inside a task context is not available yet" :absurd/not-implemented {}))
+  [ctx task-id {:keys [queue timeout step-name]}]
+  (let [queue (validate-queue-name (or queue (:queue ctx)))]
+    (when (= queue (:queue ctx))
+      (fail (str "await-task-result cannot wait on tasks in the same queue because this can "
+                 "deadlock workers. Spawn the child in a different queue and pass :queue.")
+            :absurd/same-queue-wait {:task-id task-id
+                                     :queue queue}))
+    (let [app (::client ctx)
+          wait (fn []
+                 ;; Refresh the lease first: earlier handler work may have used
+                 ;; most of the claim, and heartbeats are paced from here.
+                 (heartbeat! ctx)
+                 (let [interval-ms (max 500.0 (/ (* (::claim-timeout ctx) 1000.0) 2))
+                       next-heartbeat-at (atom (+ (System/currentTimeMillis) interval-ms))
+                       maybe-heartbeat! (fn []
+                                          (when (>= (System/currentTimeMillis) @next-heartbeat-at)
+                                            (heartbeat! ctx)
+                                            (reset! next-heartbeat-at (+ (System/currentTimeMillis) interval-ms))))]
+                   (snapshot->json
+                     (poll-task-result #(fetch-task-result app task-id {:queue queue})
+                                       task-id timeout maybe-heartbeat! (/ interval-ms 2)))))]
+      (snapshot<-json (step ctx (or step-name (str "$awaitTaskResult:" task-id)) wait)))))
 
 ;; Lease watchdog (no-ops until a worker attaches a lease)
 
