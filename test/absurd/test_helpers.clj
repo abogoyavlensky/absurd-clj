@@ -4,7 +4,8 @@
   Tests run against a Testcontainers Postgres started lazily from the JDBC
   URL. Each test gets one real connection because `absurd.fake_now` is a
   session-scoped setting."
-  (:require [clojure.string :as str]
+  (:require [absurd.core :as absurd]
+            [clojure.string :as str]
             [jsonista.core :as json]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs])
@@ -65,6 +66,38 @@
   "A fresh queue name such as `sdk_1a2b3c4d`."
   ([] (random-queue "sdk"))
   ([prefix] (str prefix "_" (subs (str (random-uuid)) 0 8))))
+
+(defn test-client
+  "A client bound to `*conn*` on a fresh queue (created), following `fake_now`.
+  Options are merged over the defaults; `:queue` overrides the random name."
+  ([] (test-client {}))
+  ([opts]
+   (let [queue (or (:queue opts) (random-queue))
+         app (absurd/client (merge {:db *conn*
+                                    :queue queue
+                                    :now-fn (fake-now-fn *conn*)}
+                                   opts))]
+     (absurd/create-queue! app)
+     app)))
+
+(defn count-tasks
+  [conn queue]
+  (:n (jdbc/execute-one! conn [(str "select count(*) as n from absurd.t_" queue)] row-opts)))
+
+(defn count-checkpoints
+  [conn queue task-id]
+  (:n (jdbc/execute-one!
+        conn [(str "select count(*) as n from absurd.c_" queue " where task_id = ?::uuid") task-id]
+        row-opts)))
+
+(defn ex-type
+  "Run `f`; return the `:type` of a thrown ex-info, or nil when nothing threw."
+  [f]
+  (try
+    (f)
+    nil
+    (catch clojure.lang.ExceptionInfo e
+      (:type (ex-data e)))))
 
 (defn- decode-value
   [v]
