@@ -4,8 +4,11 @@
 
   A client is an open map built by `client`. Handlers are plain functions
   `(fn [params ctx] ...)`. Every context operation takes the context first."
-  (:require [absurd.sql :as sql]
+  (:require [absurd.json :as json]
+            [absurd.sql :as sql]
+            [clojure.stacktrace :as stacktrace]
             [clojure.string :as str]
+            [clojure.tools.logging :as log]
             [next.jdbc :as jdbc])
   (:import [java.net URI URLEncoder]
            [java.nio.charset StandardCharsets]
@@ -388,15 +391,243 @@
               worker-id "worker"}}]
    (sql/claim-tasks! (:db app) (:queue app) worker-id claim-timeout batch-size)))
 
-;; Placeholders completed in later tasks
+;; Task context
+
+(def ^:dynamic *context*
+  "The task context of the handler running on this thread, or nil."
+  nil)
+
+(defn current-context
+  "The current task context when called inside a handler, else nil."
+  []
+  *context*)
+
+(def ^:private not-found ::not-found)
+
+(defn- ctx-db
+  [ctx]
+  (:db (::client ctx)))
+
+(defn- decode-headers
+  [headers]
+  (cond
+    (nil? headers) {}
+    (map? headers) headers
+    :else (fail "invalid task headers: headers payload must be a JSON object"
+                :absurd/invalid-headers {:headers headers})))
+
+(declare lease-touch! lease-stop!)
+
+(defn- make-context
+  "Build the context for a claimed task, preloading its checkpoints."
+  [app claim claim-timeout lease]
+  (let [queue (:queue app)
+        headers (decode-headers (:headers claim))
+        checkpoints (into {}
+                          (map (juxt :checkpoint-name :state))
+                          (sql/get-task-checkpoint-states (:db app) queue (:task-id claim) (:run-id claim)))]
+    {:task-id (:task-id claim)
+     :run-id (:run-id claim)
+     :task-name (:task-name claim)
+     :attempt (:attempt claim)
+     :queue queue
+     :headers headers
+     ::client app
+     ::claim-timeout claim-timeout
+     ::wake-event (atom {:event (:wake-event claim)
+                         :payload (:event-payload claim)})
+     ::checkpoints (atom checkpoints)
+     ::step-counter (atom {})
+     ::lease lease}))
+
+(defn- checkpoint-name!
+  "The concrete checkpoint name for `step-name` in this run: `name`, then
+  `name#2`, `name#3` for repeated uses."
+  [ctx step-name]
+  (let [n (get (swap! (::step-counter ctx) update step-name (fnil inc 0)) step-name)]
+    (if (= 1 n) step-name (str step-name "#" n))))
+
+(defn- lookup-checkpoint
+  [ctx checkpoint-name]
+  (let [cache @(::checkpoints ctx)]
+    (if (contains? cache checkpoint-name)
+      (get cache checkpoint-name)
+      (if-let [row (sql/get-task-checkpoint-state (ctx-db ctx) (:queue ctx) (:task-id ctx) checkpoint-name)]
+        (do (swap! (::checkpoints ctx) assoc checkpoint-name (:state row))
+            (:state row))
+        not-found))))
+
+(defn- persist-checkpoint!
+  [ctx checkpoint-name value]
+  (sql/set-task-checkpoint-state! (ctx-db ctx) (:queue ctx) (:task-id ctx) checkpoint-name
+                                  value (:run-id ctx) (::claim-timeout ctx))
+  (swap! (::checkpoints ctx) assoc checkpoint-name value)
+  (lease-touch! ctx (::claim-timeout ctx))
+  nil)
+
+(defn begin-step
+  "Start a step. Returns a handle `{:name :checkpoint-name :done? :state}`;
+  when `:done?` is true the step already ran and `:state` holds its value."
+  [ctx step-name]
+  (let [checkpoint-name (checkpoint-name! ctx step-name)
+        state (lookup-checkpoint ctx checkpoint-name)]
+    (if (identical? state not-found)
+      {:name step-name
+       :checkpoint-name checkpoint-name
+       :done? false}
+      {:name step-name
+       :checkpoint-name checkpoint-name
+       :done? true
+       :state state})))
+
+(defn complete-step
+  "Persist `value` for a step started with `begin-step`. Returns the value as
+  it will be seen on replay (after a JSON round trip)."
+  [ctx handle value]
+  (if (:done? handle)
+    (:state handle)
+    (let [value (json/round-trip value)]
+      (persist-checkpoint! ctx (:checkpoint-name handle) value)
+      value)))
+
+(defn step
+  "Run `f` once per task under `step-name` and checkpoint its result.
+  Replays return the stored value without calling `f`."
+  [ctx step-name f]
+  (let [handle (begin-step ctx step-name)]
+    (if (:done? handle)
+      (:state handle)
+      (complete-step ctx handle (f)))))
+
+(defn heartbeat!
+  "Extend the current run's lease by `seconds` (default: the claim timeout)."
+  ([ctx] (heartbeat! ctx (::claim-timeout ctx)))
+  ([ctx seconds]
+   (sql/extend-claim! (ctx-db ctx) (:queue ctx) (:run-id ctx) seconds)
+   (lease-touch! ctx seconds)
+   nil))
 
 (defn- context-emit-event!
-  [_ctx _event-name _payload]
-  (fail "task context operations are not available yet" :absurd/not-implemented {}))
+  [ctx event-name payload]
+  (sql/emit-event! (ctx-db ctx) (:queue ctx) event-name payload))
 
 (defn- context-await-task-result
   [_ctx _task-id _opts]
-  (fail "task context operations are not available yet" :absurd/not-implemented {}))
+  (fail "await-task-result inside a task context is not available yet" :absurd/not-implemented {}))
+
+;; Lease watchdog (no-ops until a worker attaches a lease)
+
+(defn- lease-touch!
+  [_ctx _seconds]
+  nil)
+
+(defn- lease-stop!
+  [_lease]
+  nil)
+
+;; Execution
+
+(def ^:private unknown-task-defer-base-seconds 15)
+(def ^:private unknown-task-defer-jitter-seconds 15)
+
+(defn- unknown-task-defer-seconds
+  "15 s plus a deterministic jitter of up to 15 s derived from the run id."
+  [run-id]
+  (+ unknown-task-defer-base-seconds
+     (mod (reduce + (map int run-id)) (inc unknown-task-defer-jitter-seconds))))
+
+(defn- signal-type
+  [^Throwable t]
+  (when (instance? clojure.lang.ExceptionInfo t)
+    (:type (ex-data t))))
+
+(defn- terminal-signal?
+  [t]
+  (contains? #{:absurd/cancelled :absurd/failed-run} (signal-type t)))
+
+(defn- failure-payload
+  "The JSON failure payload stored by `fail_run`."
+  [^Throwable t]
+  {:name (.getSimpleName (class t))
+   :message (or (.getMessage t) "")
+   :traceback (with-out-str (stacktrace/print-cause-trace t))})
+
+(defn- fail-run!
+  "Record a failure for the run, ignoring cancelled/already-failed signals."
+  [app run-id ^Throwable t]
+  (try
+    (sql/fail-run! (:db app) (:queue app) run-id (failure-payload t))
+    (catch clojure.lang.ExceptionInfo e
+      (when-not (terminal-signal? e)
+        (throw e)))))
+
+(defn- defer-unknown-task!
+  [app claim]
+  (let [run-id (:run-id claim)]
+    (try
+      (let [defer-seconds (unknown-task-defer-seconds run-id)]
+        (sql/schedule-run-after! (:db app) (:queue app) run-id defer-seconds)
+        (log/warnf "claimed unknown task %s (%s); deferred run %s by %ds"
+                   (:task-name claim) (:task-id claim) run-id defer-seconds))
+      (catch Throwable t
+        (log/warnf t "failed to defer unknown task %s (%s)" (:task-name claim) (:task-id claim))
+        (fail-run! app run-id t)))))
+
+(defn- run-handler!
+  [app registration claim claim-timeout lease]
+  (let [ctx (make-context app claim claim-timeout lease)
+        execute #((:handler registration) (:params claim) ctx)
+        wrap (get-in app [:hooks :wrap-task-execution])]
+    (binding [*context* ctx]
+      (if wrap
+        (wrap ctx execute)
+        (execute)))))
+
+(defn- execute-task!
+  "Run one claimed task to completion, suspension or failure."
+  [app claim claim-timeout lease]
+  (let [registration (get @(:registry app) (:task-name claim))
+        run-id (:run-id claim)]
+    (cond
+      (nil? registration)
+      (defer-unknown-task! app claim)
+
+      (not= (:queue registration) (:queue app))
+      (do (log/warnf "misconfigured task %s (queue mismatch)" (:task-name claim))
+          (fail-run! app run-id (ex-info "Misconfigured task (queue mismatch)"
+                                         {:type :absurd/queue-mismatch
+                                          :task-name (:task-name claim)
+                                          :registered-queue (:queue registration)
+                                          :queue (:queue app)})))
+
+      :else
+      (try
+        (let [result (run-handler! app registration claim claim-timeout lease)]
+          (sql/complete-run! (:db app) (:queue app) run-id (json/round-trip result)))
+        (catch Throwable t
+          (case (signal-type t)
+            (:absurd/suspend :absurd/cancelled :absurd/failed-run) nil
+            (do (log/warnf t "task %s (%s) failed" (:task-name claim) (:task-id claim))
+                (fail-run! app run-id t))))
+        (finally
+          (lease-stop! lease))))
+    nil))
+
+(defn work-batch!
+  "Claim up to `:batch-size` tasks and run them sequentially on this thread.
+  Options: `:worker-id` (\"worker\"), `:claim-timeout` seconds (120), `:batch-size` (1)."
+  ([app] (work-batch! app {}))
+  ([app {:keys [worker-id claim-timeout batch-size]
+         :or {worker-id "worker"
+              claim-timeout 120
+              batch-size 1}}]
+   (doseq [claim (claim-tasks! app {:worker-id worker-id
+                                    :claim-timeout claim-timeout
+                                    :batch-size batch-size})]
+     (execute-task! app claim claim-timeout nil))
+   nil))
+
+;; Placeholders completed in later tasks
 
 (defn stop-worker!
   [_worker]
