@@ -25,7 +25,8 @@ Alpha. Not published to Clojars yet. Use it as a git dependency:
 
 You also need a Postgres JDBC driver on the classpath. The library depends on
 `org.postgresql/postgresql`, so nothing extra is required unless you want a
-different version.
+different version. The library also runs under let-go; see
+[Running under let-go](#running-under-let-go).
 
 ## Setup
 
@@ -251,6 +252,28 @@ All SDK errors are `ex-info` with a `:type` key:
 | `:absurd/suspend`, `:absurd/cancelled`, `:absurd/failed-run` | Internal control flow; never reach user code outside a hook |
 
 Database errors from the driver propagate unchanged.
+
+## Running under let-go
+
+The sources are `.cljc` with a `:lg` branch, so the SDK also runs on
+[let-go](https://github.com/nooga/let-go) through
+[lgx](https://github.com/abogoyavlensky/lgx). The JVM branch uses next.jdbc
+and jsonista; the let-go branch uses letgo-packages'
+[`postgres`](https://github.com/abogoyavlensky/letgo-packages/tree/master/postgres)
+driver (pure-Go pgx) and the built-in `json` namespace. Same task code, same
+checkpoints, same queues as the JVM and the other upstream SDKs.
+
+Differences under let-go:
+
+- `:db` accepts a `postgres.core` connection, a `postgres://` URL string, or nil.
+- The worker handle is not `Closeable` or `deref`-able; use `worker-status`
+  and `stop-worker!`. The worker is a goroutine loop with one goroutine per task.
+- Wake times for `sleep-until` are a Go `time.Time` (what `now` returns),
+  epoch seconds, or an ISO-8601 string.
+- Logging goes to stderr; there is no logging backend to configure.
+- The default worker id is `hostname:random` rather than `hostname:pid`.
+
+A runnable example lives in lgx's `examples/clojure-libs/with-absurd`.
 
 ## Try it
 

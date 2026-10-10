@@ -10,6 +10,10 @@ Targets Absurd schema version 0.5.0.
 
 ### Added
 
+- let-go support: the sources are `.cljc` with an `:lg` branch over
+  letgo-packages' `postgres` driver and the built-in `json` namespace, plus
+  `worker-status` for inspecting a worker handle on both platforms.
+
 - `absurd.core` client: `client`, `close!`, `register-task!`, `spawn!`,
   `fetch-task-result`, `await-task-result`, `emit-event!`, `cancel-task!`,
   `retry-task!`, `create-queue!`, `drop-queue!`, `list-queues`,

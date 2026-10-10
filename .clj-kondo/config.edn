@@ -1,3 +1,6 @@
-{:linters {:single-key-in {:level :warning}
+{;; The sources are .cljc with :lg (let-go) and :clj branches; there is no
+ ;; ClojureScript build, so lint only the :clj branch.
+ :cljc {:features #{:clj}}
+ :linters {:single-key-in {:level :warning}
            :shadowed-var {:level :warning}
            :refer-all {:exclude [clojure.test]}}}

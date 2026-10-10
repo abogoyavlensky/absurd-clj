@@ -4,24 +4,26 @@
 
   A client is an open map built by `client`. Handlers are plain functions
   `(fn [params ctx] ...)`. Every context operation takes the context first."
-  (:require [absurd.json :as json]
+  (:refer-clojure :exclude [close!])
+  (:require #?@(:lg [[postgres.core :as pg]]
+                :clj [[clojure.stacktrace :as stacktrace]
+                      [clojure.tools.logging :as log]
+                      [next.jdbc :as jdbc]])
+            [absurd.json :as json]
             [absurd.sql :as sql]
-            [clojure.stacktrace :as stacktrace]
-            [clojure.string :as str]
-            [clojure.tools.logging :as log]
-            [next.jdbc :as jdbc])
-  (:import [clojure.lang IDeref]
-           [java.io Closeable]
-           [java.lang ProcessHandle]
-           [java.net InetAddress URI URLEncoder]
-           [java.nio.charset StandardCharsets]
-           [java.sql Connection]
-           [java.time Instant OffsetDateTime]
-           [java.util Date]
-           [java.util.concurrent CountDownLatch ExecutorService Executors ScheduledExecutorService
-            ScheduledFuture Semaphore ThreadFactory TimeUnit]
-           [java.util.concurrent.locks ReentrantLock]
-           [javax.sql DataSource]))
+            [clojure.string :as str])
+  #?(:lg nil :clj (:import [clojure.lang IDeref]
+                           [java.io Closeable]
+                           [java.lang ProcessHandle]
+                           [java.net InetAddress URI URLEncoder]
+                           [java.nio.charset StandardCharsets]
+                           [java.sql Connection]
+                           [java.time Instant OffsetDateTime]
+                           [java.util Date]
+                           [java.util.concurrent CountDownLatch ExecutorService Executors ScheduledExecutorService
+                            ScheduledFuture Semaphore ThreadFactory TimeUnit]
+                           [java.util.concurrent.locks ReentrantLock]
+                           [javax.sql DataSource])))
 
 (def ^:private max-queue-name-bytes 57)
 
@@ -32,6 +34,89 @@
 (defn- enum-str
   [v]
   (some-> v name))
+
+;; Platform helpers (JVM vs let-go)
+
+(defn- sleep-millis
+  [ms]
+  #?(:lg (sleep (long ms))
+     :clj (Thread/sleep (long ms))))
+
+(defn- warnf
+  [fmt & args]
+  #?(:lg (binding [*out* *err*]
+           (println "WARN absurd.core -" (apply format fmt args)))
+     :clj (log/warn (apply format fmt args))))
+
+(defn- warn-ex
+  [t msg]
+  #?(:lg (binding [*out* *err*]
+           (println "WARN absurd.core -" msg (str t)))
+     :clj (log/warn t msg)))
+
+(defn- error-ex
+  [t msg]
+  #?(:lg (binding [*out* *err*]
+           (println "ERROR absurd.core -" msg (str t)))
+     :clj (log/error t msg)))
+
+#?(:lg
+   (defn- days-from-civil
+     "Days since 1970-01-01 for a proleptic Gregorian date."
+     [y m d]
+     (let [y (if (<= m 2) (dec y) y)
+           era (quot (if (>= y 0) y (- y 399)) 400)
+           yoe (- y (* era 400))
+           doy (+ (quot (+ (* 153 (+ m (if (> m 2) -3 9))) 2) 5) (dec d))
+           doe (+ (* yoe 365) (quot yoe 4) (- (quot yoe 100)) doy)]
+       (+ (* era 146097) doe -719468))))
+
+#?(:lg
+   (defn- civil-from-days
+     [z]
+     (let [z (+ z 719468)
+           era (quot (if (>= z 0) z (- z 146096)) 146097)
+           doe (- z (* era 146097))
+           yoe (quot (- doe (quot doe 1460) (- (quot doe 36524)) (quot doe 146096)) 365)
+           y (+ yoe (* era 400))
+           doy (- doe (- (+ (* 365 yoe) (quot yoe 4)) (quot yoe 100)))
+           mp (quot (+ (* 5 doy) 2) 153)
+           d (inc (- doy (quot (+ (* 153 mp) 2) 5)))
+           m (if (< mp 10) (+ mp 3) (- mp 9))]
+       [(if (<= m 2) (inc y) y) m d])))
+
+#?(:lg
+   (defn- ms->iso
+     "Epoch milliseconds as an ISO-8601 UTC string (fraction only when non-zero),
+     the same shape `java.time.Instant/toString` produces."
+     [ms]
+     (let [days (quot ms 86400000)
+           rem-ms (mod ms 86400000)
+           [y m d] (civil-from-days days)
+           h (quot rem-ms 3600000)
+           mi (quot (mod rem-ms 3600000) 60000)
+           s (quot (mod rem-ms 60000) 1000)
+           frac (mod rem-ms 1000)]
+       (str (format "%04d-%02d-%02dT%02d:%02d:%02d" y m d h mi s)
+            (when (pos? frac) (format ".%03d" frac))
+            "Z"))))
+
+#?(:lg
+   (defn- iso->ms
+     "Parse `YYYY-MM-DDTHH:MM:SS[.fraction](Z|+HH:MM)` into epoch milliseconds."
+     [s]
+     (let [[_ y mo d h mi sec frac _ sign tzh tzm]
+           (re-matches #"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):?(\d{2}))?" s)]
+       (when-not y
+         (fail (str "invalid ISO-8601 timestamp: " s) :absurd/invalid-wake-at {:wake-at s}))
+       (let [n #(Long/parseLong %)
+             frac-ms (if frac (n (subs (str frac "000") 0 3)) 0)
+             offset-ms (if sign
+                         (* (if (= "-" sign) -1 1) (+ (* (n tzh) 3600000) (* (n tzm) 60000)))
+                         0)]
+         (- (+ (* (days-from-civil (n y) (n mo) (n d)) 86400000)
+               (* (n h) 3600000) (* (n mi) 60000) (* (n sec) 1000) frac-ms)
+            offset-ms)))))
 
 ;; Connection resolution
 
@@ -45,46 +130,64 @@
        (not-empty (get env "PGDATABASE"))
        "postgresql://localhost/absurd")))
 
-(defn- query-param
-  "A `key=value` pair with the value URL-encoded the way pgjdbc decodes it."
-  [k ^String v]
-  (str k "=" (URLEncoder/encode v StandardCharsets/UTF_8)))
+#?(:lg nil :clj
+   (defn- query-param
+     "A `key=value` pair with the value URL-encoded the way pgjdbc decodes it."
+     [k ^String v]
+     (str k "=" (URLEncoder/encode v StandardCharsets/UTF_8))))
 
-(defn ->jdbc-url
-  "Convert a `postgresql://` or `postgres://` URL, a bare database name, or a
-  `jdbc:` URL into a JDBC URL for the Postgres driver. Credentials in the
-  URL authority become `user` and `password` query parameters."
-  ^String [^String s]
-  (cond
-    (str/starts-with? s "jdbc:")
-    s
+#?(:lg nil :clj
+   (defn ->jdbc-url
+     "Convert a `postgresql://` or `postgres://` URL, a bare database name, or a
+     `jdbc:` URL into a JDBC URL for the Postgres driver. Credentials in the
+     URL authority become `user` and `password` query parameters."
+     ^String [^String s]
+     (cond
+       (str/starts-with? s "jdbc:")
+       s
 
-    (re-find #"^(postgresql|postgres)://" s)
-    (let [uri (URI. s)
-          host (or (.getHost uri) "localhost")
-          port (.getPort uri)
-          [user password] (some-> (.getUserInfo uri) (str/split #":" 2))
-          params (cond-> []
-                   user (conj (query-param "user" user))
-                   password (conj (query-param "password" password))
-                   (.getRawQuery uri) (conj (.getRawQuery uri)))]
-      (str "jdbc:postgresql://" host
-           (when (pos? port) (str ":" port))
-           (.getRawPath uri)
-           (when (seq params) (str "?" (str/join "&" params)))))
+       (re-find #"^(postgresql|postgres)://" s)
+       (let [uri (URI. s)
+             host (or (.getHost uri) "localhost")
+             port (.getPort uri)
+             [user password] (some-> (.getUserInfo uri) (str/split #":" 2))
+             params (cond-> []
+                      user (conj (query-param "user" user))
+                      password (conj (query-param "password" password))
+                      (.getRawQuery uri) (conj (.getRawQuery uri)))]
+         (str "jdbc:postgresql://" host
+              (when (pos? port) (str ":" port))
+              (.getRawPath uri)
+              (when (seq params) (str "?" (str/join "&" params)))))
 
-    :else
-    (str "jdbc:postgresql://localhost/" s)))
+       :else
+       (str "jdbc:postgresql://localhost/" s))))
+
+#?(:lg
+   (defn- ->pg-url
+     "A URL the pgx driver accepts: `postgres://` and `postgresql://` as is,
+     `jdbc:` prefixes stripped, a bare database name on localhost."
+     [^String s]
+     (cond
+       (str/starts-with? s "jdbc:") (subs s 5)
+       (re-find #"^(postgresql|postgres)://" s) s
+       :else (str "postgres://localhost/" s))))
 
 (defn- ->connectable
   [db]
-  (cond
-    (nil? db) (jdbc/get-datasource (->jdbc-url (resolve-database-url)))
-    (string? db) (jdbc/get-datasource (->jdbc-url db))
-    (instance? Connection db) db
-    (instance? DataSource db) db
-    :else (fail "Unsupported :db value; expected a DataSource, Connection, URL string or nil"
-                :absurd/invalid-db {:db db})))
+  #?(:lg (cond
+           (nil? db) (pg/open (->pg-url (resolve-database-url)))
+           (string? db) (pg/open (->pg-url db))
+           (map? db) db
+           :else (fail "Unsupported :db value; expected a postgres.core connection, URL string or nil"
+                       :absurd/invalid-db {:db db}))
+     :clj (cond
+            (nil? db) (jdbc/get-datasource (->jdbc-url (resolve-database-url)))
+            (string? db) (jdbc/get-datasource (->jdbc-url db))
+            (instance? Connection db) db
+            (instance? DataSource db) db
+            :else (fail "Unsupported :db value; expected a DataSource, Connection, URL string or nil"
+                        :absurd/invalid-db {:db db}))))
 
 ;; Validation
 
@@ -93,7 +196,7 @@
   [queue]
   (when (or (nil? queue) (= "" queue))
     (fail "Queue name must be provided" :absurd/invalid-queue-name {:queue queue}))
-  (when (> (count (.getBytes ^String queue StandardCharsets/UTF_8)) max-queue-name-bytes)
+  (when (> (count (.getBytes ^String queue "UTF-8")) max-queue-name-bytes)
     (fail (str "Queue name '" queue "' is too long (max " max-queue-name-bytes " bytes).")
           :absurd/invalid-queue-name {:queue queue}))
   queue)
@@ -130,7 +233,7 @@
      :or {queue "default"
           max-attempts 5
           hooks {}
-          now-fn #(Instant/now)}}]
+          now-fn #?(:lg now :clj #(Instant/now))}}]
    (validate-queue-name queue)
    {:db (->connectable db)
     :owned-db? (or (nil? db) (string? db))
@@ -148,8 +251,10 @@
   [app]
   (when-let [worker @(:worker app)]
     (stop-worker! worker))
-  (when (and (:owned-db? app) (instance? Connection (:db app)))
-    (.close ^Connection (:db app)))
+  #?(:lg (when (:owned-db? app)
+           (pg/close! (:db app)))
+     :clj (when (and (:owned-db? app) (instance? Connection (:db app)))
+            (.close ^Connection (:db app))))
   nil)
 
 (defn register-task!
@@ -290,7 +395,7 @@
                 sleep-ms (if max-sleep-ms (min sleep-ms max-sleep-ms) sleep-ms)]
             (when on-before-sleep
               (on-before-sleep))
-            (Thread/sleep (long (max sleep-ms 0)))
+            (sleep-millis (max sleep-ms 0))
             (recur (min (* sleep-ms 2) 1000.0))))))))
 
 (defn fetch-task-result
@@ -526,49 +631,72 @@
   []
   (throw (ex-info "task suspended" {:type :absurd/suspend})))
 
-(defn- now
-  ^Instant [ctx]
+(defn- ctx-now
+  [ctx]
   ((:now-fn (::client ctx))))
 
-(defn- parse-instant
-  ^Instant [^String s]
-  (.toInstant (OffsetDateTime/parse s)))
+(defn- now-ms
+  [ctx]
+  #?(:lg (inst-ms (ctx-now ctx))
+     :clj (.toEpochMilli ^Instant (ctx-now ctx))))
 
-(defn- ->instant
-  ^Instant [wake-at]
-  (cond
-    (instance? Instant wake-at) wake-at
-    (instance? Date wake-at) (.toInstant ^Date wake-at)
-    (number? wake-at) (Instant/ofEpochMilli (long (* 1000 wake-at)))
-    (string? wake-at) (parse-instant wake-at)
-    :else (fail "wake-at must be an Instant, Date, epoch seconds or ISO-8601 string"
-                :absurd/invalid-wake-at {:wake-at wake-at})))
+#?(:lg nil :clj
+   (defn- parse-instant
+     ^Instant [^String s]
+     (.toInstant (OffsetDateTime/parse s))))
 
-(defn sleep-until
-  "Suspend the task until `wake-at` (an Instant, Date, epoch seconds or ISO
-  string). The wake time is checkpointed under `step-name`, so a replay keeps
-  the original wake time. Returns nil once the wake time has passed."
-  [ctx step-name wake-at]
-  (let [wake-at (->instant wake-at)
-        checkpoint-name (checkpoint-name! ctx step-name)
+(defn- ->wake-ms
+  "Epoch milliseconds for a wake time: an Instant/Date (JVM) or Go time
+  (let-go), epoch seconds as a number, or an ISO-8601 string."
+  [wake-at]
+  #?(:lg (cond
+           (number? wake-at) (long (* 1000 wake-at))
+           (string? wake-at) (iso->ms wake-at)
+           (nil? wake-at) (fail "wake-at must be a time, epoch seconds or ISO-8601 string"
+                                :absurd/invalid-wake-at {:wake-at wake-at})
+           :else (inst-ms wake-at))
+     :clj (cond
+            (instance? Instant wake-at) (.toEpochMilli ^Instant wake-at)
+            (instance? Date wake-at) (.getTime ^Date wake-at)
+            (number? wake-at) (long (* 1000 wake-at))
+            (string? wake-at) (.toEpochMilli (parse-instant wake-at))
+            :else (fail "wake-at must be an Instant, Date, epoch seconds or ISO-8601 string"
+                        :absurd/invalid-wake-at {:wake-at wake-at}))))
+
+(defn- wake-ms->iso
+  [ms]
+  #?(:lg (ms->iso ms)
+     :clj (str (Instant/ofEpochMilli ms))))
+
+(defn- sleep-until-ms
+  [ctx step-name wake-ms]
+  (let [checkpoint-name (checkpoint-name! ctx step-name)
         state (lookup-checkpoint ctx checkpoint-name)
-        actual-wake-at (cond
+        actual-wake-ms (cond
                          (identical? state not-found)
-                         (do (persist-checkpoint! ctx checkpoint-name (str wake-at))
-                             wake-at)
+                         (do (persist-checkpoint! ctx checkpoint-name (wake-ms->iso wake-ms))
+                             wake-ms)
 
-                         (string? state) (parse-instant state)
-                         :else wake-at)
-        remaining-seconds (/ (- (.toEpochMilli actual-wake-at) (.toEpochMilli (now ctx))) 1000.0)]
+                         (string? state) (->wake-ms state)
+                         :else wake-ms)
+        remaining-seconds (/ (- actual-wake-ms (now-ms ctx)) 1000.0)]
     (when (pos? remaining-seconds)
       (sql/schedule-run-after! (ctx-db ctx) (:queue ctx) (:run-id ctx) remaining-seconds)
       (suspend!))
     nil))
 
+(defn sleep-until
+  "Suspend the task until `wake-at` (an Instant or Date on the JVM, a Go time
+  under let-go, epoch seconds, or an ISO-8601 string). The wake time is
+  checkpointed under `step-name`, so a replay keeps the original wake time.
+  Returns nil once the wake time has passed."
+  [ctx step-name wake-at]
+  (sleep-until-ms ctx step-name (->wake-ms wake-at)))
+
 (defn sleep-for
   "Suspend the task for `seconds`, checkpointed under `step-name`."
   [ctx step-name seconds]
-  (sleep-until ctx step-name (.plusMillis (now ctx) (long (* 1000 seconds)))))
+  (sleep-until-ms ctx step-name (+ (now-ms ctx) (long (* 1000 seconds)))))
 
 ;; Events
 
@@ -645,43 +773,48 @@
 
 ;; Lease watchdog
 
-(defn- daemon-thread-factory
-  ^ThreadFactory [prefix]
-  (let [counter (atom 0)]
-    (reify ThreadFactory
-      (newThread [_ runnable]
-        (doto (Thread. ^Runnable runnable (str prefix "-" (swap! counter inc)))
-          (.setDaemon true))))))
+#?(:lg nil :clj
+   (defn- daemon-thread-factory
+     ^ThreadFactory [prefix]
+     (let [counter (atom 0)]
+       (reify ThreadFactory
+         (newThread [_ runnable]
+           (doto (Thread. ^Runnable runnable (str prefix "-" (swap! counter inc)))
+             (.setDaemon true)))))))
 
-(defonce ^:private watchdog-scheduler
-  (delay (Executors/newSingleThreadScheduledExecutor (daemon-thread-factory "absurd-watchdog"))))
+#?(:lg nil :clj
+   (defonce ^:private watchdog-scheduler
+     (delay (Executors/newSingleThreadScheduledExecutor (daemon-thread-factory "absurd-watchdog")))))
 
-(defmacro ^:private with-lock
-  "Run `body` while holding `lock` (a ReentrantLock); `locking` is avoided
-  because coverage tooling cannot instrument monitor-enter."
-  [lock & body]
-  `(let [^ReentrantLock lock# ~lock]
-     (.lock lock#)
-     (try
-       ~@body
-       (finally
-         (.unlock lock#)))))
+#?(:lg nil :clj
+   (defmacro ^:private with-lock
+     "Run `body` while holding `lock` (a ReentrantLock); `locking` is avoided
+     because coverage tooling cannot instrument monitor-enter."
+     [lock & body]
+     `(let [^ReentrantLock lock# ~lock]
+        (.lock lock#)
+        (try
+          ~@body
+          (finally
+            (.unlock lock#))))))
 
 (defn- new-lease
   []
-  (atom {:epoch 0
-         :stopped? false
-         :scheduled nil
-         :lock (ReentrantLock.)}))
+  (atom #?(:lg {:epoch 0
+                :stopped? false}
+           :clj {:epoch 0
+                 :stopped? false
+                 :scheduled nil
+                 :lock (ReentrantLock.)})))
 
 (defn- lease-expired!
   [ctx seconds]
-  (log/warnf "task %s (%s) exceeded claim timeout of %ss" (:task-name ctx) (:task-id ctx) seconds)
+  (warnf "task %s (%s) exceeded claim timeout of %ss" (:task-name ctx) (:task-id ctx) seconds)
   (when-let [hook (get-in (::client ctx) [:hooks :on-lease-timeout])]
     (try
       (hook ctx seconds)
       (catch Throwable t
-        (log/warn t "on-lease-timeout hook failed")))))
+        (warn-ex t "on-lease-timeout hook failed")))))
 
 (defn- lease-touch!
   "(Re)schedule the watchdog to fire `seconds` from now. Stale callbacks
@@ -689,28 +822,36 @@
   [ctx seconds]
   (when-let [lease (::lease ctx)]
     (when (pos? seconds)
-      (with-lock (:lock @lease)
-        (let [{:keys [stopped? ^ScheduledFuture scheduled]} @lease]
-          (when-not stopped?
-            (some-> scheduled (.cancel false))
-            (let [epoch (:epoch (swap! lease update :epoch inc))
-                  callback (fn []
-                             (let [current @lease]
-                               (when (and (not (:stopped? current)) (= epoch (:epoch current)))
-                                 (lease-expired! ctx seconds))))
-                  scheduled (.schedule ^ScheduledExecutorService @watchdog-scheduler
-                                       ^Runnable callback
-                                       (long (* 1000 seconds))
-                                       TimeUnit/MILLISECONDS)]
-              (swap! lease assoc :scheduled scheduled))))))))
+      #?(:lg (let [{:keys [stopped? epoch]} (swap! lease (fn [l] (if (:stopped? l) l (update l :epoch inc))))]
+               (when-not stopped?
+                 (async/thread
+                   (async/<!! (async/timeout (long (* 1000 seconds))))
+                   (let [current @lease]
+                     (when (and (not (:stopped? current)) (= epoch (:epoch current)))
+                       (lease-expired! ctx seconds))))))
+         :clj (with-lock (:lock @lease)
+                (let [{:keys [stopped? ^ScheduledFuture scheduled]} @lease]
+                  (when-not stopped?
+                    (some-> scheduled (.cancel false))
+                    (let [epoch (:epoch (swap! lease update :epoch inc))
+                          callback (fn []
+                                     (let [current @lease]
+                                       (when (and (not (:stopped? current)) (= epoch (:epoch current)))
+                                         (lease-expired! ctx seconds))))
+                          scheduled (.schedule ^ScheduledExecutorService @watchdog-scheduler
+                                               ^Runnable callback
+                                               (long (* 1000 seconds))
+                                               TimeUnit/MILLISECONDS)]
+                      (swap! lease assoc :scheduled scheduled)))))))))
 
 (defn- lease-stop!
   [lease]
   (when lease
-    (with-lock (:lock @lease)
-      (let [{:keys [^ScheduledFuture scheduled]} @lease]
-        (some-> scheduled (.cancel false))
-        (swap! lease assoc :stopped? true :scheduled nil :epoch (inc (:epoch @lease)))))))
+    #?(:lg (swap! lease (fn [l] (assoc l :stopped? true :epoch (inc (:epoch l)))))
+       :clj (with-lock (:lock @lease)
+              (let [{:keys [^ScheduledFuture scheduled]} @lease]
+                (some-> scheduled (.cancel false))
+                (swap! lease assoc :stopped? true :scheduled nil :epoch (inc (:epoch @lease))))))))
 
 ;; Execution
 
@@ -735,9 +876,13 @@
 (defn- failure-payload
   "The JSON failure payload stored by `fail_run`."
   [^Throwable t]
-  {:name (.getSimpleName (class t))
-   :message (or (.getMessage t) "")
-   :traceback (with-out-str (stacktrace/print-cause-trace t))})
+  #?(:lg (let [full-name (str (type t))]
+           {:name (subs full-name (inc (or (str/last-index-of full-name ".") -1)))
+            :message (or (ex-message t) "")
+            :traceback (str/join "\n" (cons (str t) (:trace (ex-data t))))})
+     :clj {:name (.getSimpleName (class t))
+           :message (or (.getMessage t) "")
+           :traceback (with-out-str (stacktrace/print-cause-trace t))}))
 
 (defn- fail-run!
   "Record a failure for the run, ignoring cancelled/already-failed signals."
@@ -754,10 +899,10 @@
     (try
       (let [defer-seconds (unknown-task-defer-seconds run-id)]
         (sql/schedule-run-after! (:db app) (:queue app) run-id defer-seconds)
-        (log/warnf "claimed unknown task %s (%s); deferred run %s by %ds"
-                   (:task-name claim) (:task-id claim) run-id defer-seconds))
+        (warnf "claimed unknown task %s (%s); deferred run %s by %ds"
+               (:task-name claim) (:task-id claim) run-id defer-seconds))
       (catch Throwable t
-        (log/warnf t "failed to defer unknown task %s (%s)" (:task-name claim) (:task-id claim))
+        (warn-ex t (format "failed to defer unknown task %s (%s)" (:task-name claim) (:task-id claim)))
         (fail-run! app run-id t)))))
 
 (defn- run-handler!
@@ -781,7 +926,7 @@
       (defer-unknown-task! app claim)
 
       (not= (:queue registration) (:queue app))
-      (do (log/warnf "misconfigured task %s (queue mismatch)" (:task-name claim))
+      (do (warnf "misconfigured task %s (queue mismatch)" (:task-name claim))
           (fail-run! app run-id (ex-info "Misconfigured task (queue mismatch)"
                                          {:type :absurd/queue-mismatch
                                           :task-name (:task-name claim)
@@ -795,7 +940,7 @@
         (catch Throwable t
           (case (signal-type t)
             (:absurd/suspend :absurd/cancelled :absurd/failed-run) nil
-            (do (log/warnf t "task %s (%s) failed" (:task-name claim) (:task-id claim))
+            (do (warn-ex t (format "task %s (%s) failed" (:task-name claim) (:task-id claim)))
                 (fail-run! app run-id t))))
         (finally
           (lease-stop! lease))))
@@ -818,47 +963,13 @@
 ;; Worker
 
 (defprotocol ^:private WorkerControl
-  (-stop! [worker]))
+  (-stop! [worker])
+  (-status [worker]))
 
 (defn- default-worker-id
   []
-  (str (.getHostName (InetAddress/getLocalHost)) ":" (.pid (ProcessHandle/current))))
-
-(defn- pause
-  "Wait up to `ms` milliseconds, returning early once `stop-latch` is released."
-  [^CountDownLatch stop-latch ms]
-  (.await stop-latch (long ms) TimeUnit/MILLISECONDS))
-
-(defn- run-claimed!
-  [app claim claim-timeout ^Semaphore capacity]
-  (try
-    (execute-task! app claim claim-timeout (new-lease))
-    (catch Throwable t
-      (log/error t "unexpected error while executing task" (:task-name claim)))
-    (finally
-      (.release capacity))))
-
-(defn- worker-loop
-  [app state ^CountDownLatch stop-latch ^Semaphore capacity ^ExecutorService executor]
-  (let [{:keys [worker-id claim-timeout batch-size poll-interval]} @state]
-    (while (:running? @state)
-      (let [available (.availablePermits capacity)]
-        (if (zero? available)
-          (pause stop-latch poll-interval)
-          (let [claims (try
-                         (claim-tasks! app {:batch-size (min batch-size available)
-                                            :claim-timeout claim-timeout
-                                            :worker-id worker-id})
-                         (catch Throwable t
-                           (log/warn t "worker failed to claim tasks")
-                           ::error))]
-            (if (or (= ::error claims) (empty? claims))
-              (pause stop-latch poll-interval)
-              ;; Claimed tasks are always dispatched, even when a stop is in
-              ;; progress, so leased work is never stranded.
-              (doseq [claim claims]
-                (.acquireUninterruptibly capacity)
-                (.execute executor ^Runnable #(run-claimed! app claim claim-timeout capacity))))))))))
+  #?(:lg (str (os/hostname) ":" (subs (str (random-uuid)) 7 15))
+     :clj (str (.getHostName (InetAddress/getLocalHost)) ":" (.pid (ProcessHandle/current)))))
 
 (defn stop-worker!
   "Stop claiming, wait for in-flight tasks (bounded by `:shutdown-timeout`)
@@ -868,75 +979,235 @@
   [worker]
   (-stop! worker))
 
-(defn start-worker!
-  "Start a polling worker on a background thread and return its handle.
-  The handle is `Closeable` (close = `stop-worker!`) and `deref`-able for a
-  status map (`:worker-id`, `:running?`, `:concurrency`, `:queue`).
+(defn worker-status
+  "The worker's status map: `:worker-id`, `:queue`, `:concurrency`,
+  `:running?` and, once stopped, `:drained?`. On the JVM the handle can also
+  be `deref`ed."
+  [worker]
+  (-status worker))
 
-  A client runs at most one worker at a time; starting a second one throws
-  `:absurd/worker-already-running`.
+(defn- claim-batch!
+  "One claim for the worker loop; `::error` when the database call failed."
+  [app worker-id claim-timeout batch-size]
+  (try
+    (claim-tasks! app {:batch-size batch-size
+                       :claim-timeout claim-timeout
+                       :worker-id worker-id})
+    (catch Throwable t
+      (warn-ex t "worker failed to claim tasks")
+      ::error)))
 
-  Options: `:worker-id` (hostname:pid), `:claim-timeout` seconds (120),
-  `:concurrency` (1), `:batch-size` (= concurrency), `:poll-interval` ms (250),
-  `:shutdown-timeout` seconds (60)."
-  ([app] (start-worker! app {}))
-  ([app {:keys [worker-id claim-timeout concurrency batch-size poll-interval shutdown-timeout]
-         :or {claim-timeout 120
-              concurrency 1
-              poll-interval 250
-              shutdown-timeout 60}}]
-   (let [worker-id (or worker-id (default-worker-id))
-         concurrency (max 1 (long concurrency))
-         capacity (Semaphore. concurrency)
-         executor (Executors/newFixedThreadPool concurrency (daemon-thread-factory "absurd-task"))
-         state (atom {:worker-id worker-id
-                      :queue (:queue app)
-                      :concurrency concurrency
-                      :running? true
-                      :claim-timeout claim-timeout
-                      :batch-size (or batch-size concurrency)
-                      :poll-interval poll-interval})
-         handle-ref (atom nil)
-         stop-lock (ReentrantLock.)
-         stop-latch (CountDownLatch. 1)
-         thread (Thread. ^Runnable #(worker-loop app state stop-latch capacity executor)
-                         (str "absurd-worker-" worker-id))
-         stop! (fn []
-                 (with-lock stop-lock
-                   (if (contains? @state :drained?)
-                     (:drained? @state)
-                     (let [deadline (+ (System/nanoTime) (long (* 1e9 shutdown-timeout)))
-                           remaining-ms #(max 0 (quot (- deadline (System/nanoTime)) 1000000))]
-                       (swap! state assoc :running? false)
-                       ;; Wake the loop from its poll wait; a claim in flight finishes
-                       ;; and dispatches first. join(0) would block forever, so skip it
-                       ;; once the budget is gone.
-                       (.countDown stop-latch)
-                       (let [budget (remaining-ms)]
-                         (when (pos? budget)
-                           (.join thread (long budget))))
-                       (.shutdown executor)
-                       (let [drained? (and (not (.isAlive thread))
-                                           (.awaitTermination executor (long (remaining-ms))
-                                                              TimeUnit/MILLISECONDS))]
-                         (when-not drained?
-                           (log/warnf "worker %s stopped with %d task(s) still running"
-                                      worker-id (- concurrency (.availablePermits capacity))))
-                         (swap! state assoc :drained? drained?)
-                         (compare-and-set! (:worker app) @handle-ref nil)
-                         drained?)))))
-         handle (reify
-                  WorkerControl
-                  (-stop! [_] (stop!))
-                  IDeref
-                  (deref [_] @state)
-                  Closeable
-                  (close [_] (stop!) nil))]
-     (reset! handle-ref handle)
-     (when-not (compare-and-set! (:worker app) nil handle)
-       (.shutdown executor)
-       (fail "a worker is already running on this client; stop it first"
-             :absurd/worker-already-running {:worker-id (:worker-id @@(:worker app))}))
-     (.setDaemon thread true)
-     (.start thread)
-     handle)))
+#?(:lg
+   (defn- pause
+     "Wait up to `ms` milliseconds, returning early once `stop-ch` closes."
+     [stop-ch ms]
+     (async/alts!! [stop-ch (async/timeout (long ms))])
+     nil))
+
+#?(:lg
+   (defn- run-claimed!
+     [app claim claim-timeout in-flight]
+     (try
+       (execute-task! app claim claim-timeout (new-lease))
+       (catch Throwable t
+         (error-ex t (str "unexpected error while executing task " (:task-name claim))))
+       (finally
+         (swap! in-flight dec)))))
+
+#?(:lg
+   (defn- worker-loop
+     [app state stop-ch in-flight]
+     (let [{:keys [worker-id claim-timeout batch-size poll-interval concurrency]} @state]
+       (while (:running? @state)
+         (let [available (- concurrency @in-flight)]
+           (if (<= available 0)
+             (pause stop-ch poll-interval)
+             (let [claims (claim-batch! app worker-id claim-timeout (min batch-size available))]
+               (if (or (= ::error claims) (empty? claims))
+                 (pause stop-ch poll-interval)
+                 ;; Claimed tasks are always dispatched, even when a stop is in
+                 ;; progress, so leased work is never stranded.
+                 (doseq [claim claims]
+                   (swap! in-flight inc)
+                   (async/thread (run-claimed! app claim claim-timeout in-flight)))))))))))
+
+#?(:lg
+   (defn start-worker!
+     "Start a polling worker on a background goroutine and return its handle.
+     Inspect it with `worker-status`; stop it with `stop-worker!`.
+
+     A client runs at most one worker at a time; starting a second one throws
+     `:absurd/worker-already-running`.
+
+     Options: `:worker-id` (hostname:random), `:claim-timeout` seconds (120),
+     `:concurrency` (1), `:batch-size` (= concurrency), `:poll-interval` ms (250),
+     `:shutdown-timeout` seconds (60)."
+     ([app] (start-worker! app {}))
+     ([app {:keys [worker-id claim-timeout concurrency batch-size poll-interval shutdown-timeout]
+            :or {claim-timeout 120
+                 concurrency 1
+                 poll-interval 250
+                 shutdown-timeout 60}}]
+      (let [worker-id (or worker-id (default-worker-id))
+            concurrency (max 1 (long concurrency))
+            stop-ch (async/chan)
+            in-flight (atom 0)
+            loop-ch (atom nil)
+            stopping? (atom false)
+            state (atom {:worker-id worker-id
+                         :queue (:queue app)
+                         :concurrency concurrency
+                         :running? true
+                         :claim-timeout claim-timeout
+                         :batch-size (or batch-size concurrency)
+                         :poll-interval poll-interval})
+            handle-ref (atom nil)
+            stop! (fn []
+                    (cond
+                      (contains? @state :drained?)
+                      (:drained? @state)
+
+                      ;; Another caller is already stopping: wait for its result.
+                      (not (compare-and-set! stopping? false true))
+                      (loop []
+                        (if (contains? @state :drained?)
+                          (:drained? @state)
+                          (do (sleep-millis 10) (recur))))
+
+                      :else
+                      (let [deadline (+ (System/nanoTime) (long (* 1e9 shutdown-timeout)))
+                            remaining-ms #(max 0 (quot (- deadline (System/nanoTime)) 1000000))]
+                        (swap! state assoc :running? false)
+                        (async/close! stop-ch)
+                        (let [budget (remaining-ms)]
+                          (when (pos? budget)
+                            (async/alts!! [@loop-ch (async/timeout budget)])))
+                        (loop []
+                          (when (and (pos? @in-flight) (pos? (remaining-ms)))
+                            (sleep-millis 20)
+                            (recur)))
+                        (let [drained? (zero? @in-flight)]
+                          (when-not drained?
+                            (warnf "worker %s stopped with %d task(s) still running" worker-id @in-flight))
+                          (swap! state assoc :drained? drained?)
+                          (compare-and-set! (:worker app) @handle-ref nil)
+                          drained?))))
+            handle (reify
+                     WorkerControl
+                     (-stop! [_] (stop!))
+                     (-status [_] @state))]
+        (reset! handle-ref handle)
+        (when-not (compare-and-set! (:worker app) nil handle)
+          (fail "a worker is already running on this client; stop it first"
+                :absurd/worker-already-running {:worker-id (:worker-id (worker-status @(:worker app)))}))
+        (reset! loop-ch (async/thread (worker-loop app state stop-ch in-flight)))
+        handle))))
+
+#?(:lg nil :clj
+   (defn- pause
+     "Wait up to `ms` milliseconds, returning early once `stop-latch` is released."
+     [^CountDownLatch stop-latch ms]
+     (.await stop-latch (long ms) TimeUnit/MILLISECONDS)))
+
+#?(:lg nil :clj
+   (defn- run-claimed!
+     [app claim claim-timeout ^Semaphore capacity]
+     (try
+       (execute-task! app claim claim-timeout (new-lease))
+       (catch Throwable t
+         (error-ex t (str "unexpected error while executing task " (:task-name claim))))
+       (finally
+         (.release capacity)))))
+
+#?(:lg nil :clj
+   (defn- worker-loop
+     [app state ^CountDownLatch stop-latch ^Semaphore capacity ^ExecutorService executor]
+     (let [{:keys [worker-id claim-timeout batch-size poll-interval]} @state]
+       (while (:running? @state)
+         (let [available (.availablePermits capacity)]
+           (if (zero? available)
+             (pause stop-latch poll-interval)
+             (let [claims (claim-batch! app worker-id claim-timeout (min batch-size available))]
+               (if (or (= ::error claims) (empty? claims))
+                 (pause stop-latch poll-interval)
+                 ;; Claimed tasks are always dispatched, even when a stop is in
+                 ;; progress, so leased work is never stranded.
+                 (doseq [claim claims]
+                   (.acquireUninterruptibly capacity)
+                   (.execute executor ^Runnable #(run-claimed! app claim claim-timeout capacity)))))))))))
+
+#?(:lg nil :clj
+   (defn start-worker!
+     "Start a polling worker on a background thread and return its handle.
+     The handle is `Closeable` (close = `stop-worker!`) and `deref`-able for a
+     status map (`:worker-id`, `:running?`, `:concurrency`, `:queue`); see also
+     `worker-status`.
+
+     A client runs at most one worker at a time; starting a second one throws
+     `:absurd/worker-already-running`.
+
+     Options: `:worker-id` (hostname:pid), `:claim-timeout` seconds (120),
+     `:concurrency` (1), `:batch-size` (= concurrency), `:poll-interval` ms (250),
+     `:shutdown-timeout` seconds (60)."
+     ([app] (start-worker! app {}))
+     ([app {:keys [worker-id claim-timeout concurrency batch-size poll-interval shutdown-timeout]
+            :or {claim-timeout 120
+                 concurrency 1
+                 poll-interval 250
+                 shutdown-timeout 60}}]
+      (let [worker-id (or worker-id (default-worker-id))
+            concurrency (max 1 (long concurrency))
+            capacity (Semaphore. concurrency)
+            executor (Executors/newFixedThreadPool concurrency (daemon-thread-factory "absurd-task"))
+            state (atom {:worker-id worker-id
+                         :queue (:queue app)
+                         :concurrency concurrency
+                         :running? true
+                         :claim-timeout claim-timeout
+                         :batch-size (or batch-size concurrency)
+                         :poll-interval poll-interval})
+            handle-ref (atom nil)
+            stop-lock (ReentrantLock.)
+            stop-latch (CountDownLatch. 1)
+            thread (Thread. ^Runnable #(worker-loop app state stop-latch capacity executor)
+                            (str "absurd-worker-" worker-id))
+            stop! (fn []
+                    (with-lock stop-lock
+                      (if (contains? @state :drained?)
+                        (:drained? @state)
+                        (let [deadline (+ (System/nanoTime) (long (* 1e9 shutdown-timeout)))
+                              remaining-ms #(max 0 (quot (- deadline (System/nanoTime)) 1000000))]
+                          (swap! state assoc :running? false)
+                          ;; Wake the loop from its poll wait; a claim in flight finishes
+                          ;; and dispatches first. join(0) would block forever, so skip it
+                          ;; once the budget is gone.
+                          (.countDown stop-latch)
+                          (let [budget (remaining-ms)]
+                            (when (pos? budget)
+                              (.join thread (long budget))))
+                          (.shutdown executor)
+                          (let [drained? (and (not (.isAlive thread))
+                                              (.awaitTermination executor (long (remaining-ms))
+                                                                 TimeUnit/MILLISECONDS))]
+                            (when-not drained?
+                              (warnf "worker %s stopped with %d task(s) still running"
+                                     worker-id (- concurrency (.availablePermits capacity))))
+                            (swap! state assoc :drained? drained?)
+                            (compare-and-set! (:worker app) @handle-ref nil)
+                            drained?)))))
+            handle (reify
+                     WorkerControl
+                     (-stop! [_] (stop!))
+                     (-status [_] @state)
+                     IDeref
+                     (deref [_] @state)
+                     Closeable
+                     (close [_] (stop!) nil))]
+        (reset! handle-ref handle)
+        (when-not (compare-and-set! (:worker app) nil handle)
+          (.shutdown executor)
+          (fail "a worker is already running on this client; stop it first"
+                :absurd/worker-already-running {:worker-id (:worker-id @@(:worker app))}))
+        (.setDaemon thread true)
+        (.start thread)
+        handle))))

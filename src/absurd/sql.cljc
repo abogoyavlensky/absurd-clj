@@ -1,55 +1,94 @@
 (ns absurd.sql
   "One function per Absurd stored procedure.
 
-  Every function takes a next.jdbc connectable first. JSON parameters are
-  encoded explicitly, known jsonb columns are decoded by name, and UUIDs are
-  returned as strings. Postgres error codes AB001 and AB002 are mapped to
-  `:absurd/cancelled` and `:absurd/failed-run` signals."
-  (:require [absurd.json :as json]
-            [next.jdbc :as jdbc]
-            [next.jdbc.result-set :as rs])
-  (:import [java.sql SQLException Timestamp]
-           [java.time Instant OffsetDateTime]))
+  Every function takes a connectable first: anything next.jdbc accepts on the
+  JVM, a `postgres.core` connection under let-go. JSON parameters are encoded
+  explicitly, known jsonb columns are decoded by name, and UUIDs are returned
+  as strings. Postgres error codes AB001 and AB002 are mapped to
+  `:absurd/cancelled` and `:absurd/failed-run` signals.
 
-(def ^:private row-opts
-  {:builder-fn rs/as-unqualified-kebab-maps})
+  SQL is written with `?` placeholders; under let-go they are rewritten to
+  `$1, $2, ...` because the pgx driver expects numbered parameters."
+  (:require #?@(:lg [[clojure.string :as str]
+                     [sql.core :as sqlc]]
+                :clj [[next.jdbc :as jdbc]
+                      [next.jdbc.result-set :as rs]])
+            [absurd.json :as json])
+  #?(:lg nil :clj (:import [java.sql SQLException Timestamp]
+                           [java.time Instant OffsetDateTime])))
 
-(defn signal-for-sqlstate
+;; Execution
+
+#?(:lg
+   (defn- dollar-placeholders
+     "Rewrite `?` placeholders as `$1`, `$2`, ... for pgx."
+     [^String sql]
+     (loop [chars (seq sql) n 1 out []]
+       (if-let [c (first chars)]
+         (if (= \? c)
+           (recur (rest chars) (inc n) (conj out (str "$" n)))
+           (recur (rest chars) n (conj out c)))
+         (apply str out)))))
+
+#?(:lg
+   (defn- kebab-keys
+     [row]
+     (when row
+       (into {} (map (fn [[k v]] [(keyword (str/replace (name k) "_" "-")) v])) row))))
+
+(defn- execute-one
+  [conn sqlvec]
+  #?(:lg (let [sqlvec (update sqlvec 0 dollar-placeholders)
+               row (sqlc/execute-one! conn sqlvec)]
+           (when-not (contains? row :sql/update-count)
+             (kebab-keys row)))
+     :clj (jdbc/execute-one! conn sqlvec {:builder-fn rs/as-unqualified-kebab-maps})))
+
+(defn- execute
+  [conn sqlvec]
+  #?(:lg (let [sqlvec (update sqlvec 0 dollar-placeholders)
+               rows (sqlc/execute! conn sqlvec)]
+           (if (and (= 1 (count rows)) (contains? (first rows) :sql/update-count))
+             []
+             (mapv kebab-keys rows)))
+     :clj (jdbc/execute! conn sqlvec {:builder-fn rs/as-unqualified-kebab-maps})))
+
+;; Signals
+
+(defn signal-for-error
   "The SDK signal for a database error, or nil when it is not AB001/AB002.
   Public because `with-task-state-errors` expands to it."
-  [^SQLException e]
-  (case (.getSQLState e)
-    "AB001" (ex-info "Task has been cancelled" {:type :absurd/cancelled} e)
-    "AB002" (ex-info "Run has already failed" {:type :absurd/failed-run} e)
-    nil))
+  [e]
+  (let [sqlstate #?(:lg (second (re-find #"SQLSTATE (AB00[12])" (or (ex-message e) "")))
+                    :clj (when (instance? SQLException e) (.getSQLState ^SQLException e)))]
+    (case sqlstate
+      "AB001" (ex-info "Task has been cancelled" {:type :absurd/cancelled} e)
+      "AB002" (ex-info "Run has already failed" {:type :absurd/failed-run} e)
+      nil)))
 
 (defmacro with-task-state-errors
   "Rethrow AB001/AB002 database errors as SDK signals."
   [& body]
   `(try
      ~@body
-     (catch SQLException e#
-       (throw (or (signal-for-sqlstate e#) e#)))))
+     (catch #?(:lg Exception :clj java.sql.SQLException) e#
+       (throw (or (signal-for-error e#) e#)))))
+
+;; Value helpers
 
 (defn- ->str
   [v]
   (some-> v str))
 
 (defn- ->instant
+  "Normalize a timestamp column: `Instant` on the JVM, Go `time.Time` under let-go."
   [v]
-  (cond
-    (instance? Timestamp v) (.toInstant ^Timestamp v)
-    (instance? OffsetDateTime v) (.toInstant ^OffsetDateTime v)
-    (instance? Instant v) v
-    :else v))
-
-(defn- execute-one
-  [conn sqlvec]
-  (jdbc/execute-one! conn sqlvec row-opts))
-
-(defn- execute
-  [conn sqlvec]
-  (jdbc/execute! conn sqlvec row-opts))
+  #?(:lg v
+     :clj (cond
+            (instance? Timestamp v) (.toInstant ^Timestamp v)
+            (instance? OffsetDateTime v) (.toInstant ^OffsetDateTime v)
+            (instance? Instant v) v
+            :else v)))
 
 ;; Queues
 
@@ -88,7 +127,7 @@
 (defn set-queue-policy!
   "`policy` is a map with snake_case string keys."
   [conn queue policy]
-  (execute-one conn ["select absurd.set_queue_policy(?, ?)" queue (json/->jsonb policy)])
+  (execute-one conn ["select absurd.set_queue_policy(?, ?::jsonb)" queue (json/->jsonb policy)])
   nil)
 
 ;; Tasks
@@ -104,7 +143,7 @@
   [conn queue task-name params options]
   (spawn-row
     (execute-one conn ["select task_id, run_id, attempt, created
-                        from absurd.spawn_task(?, ?, ?, ?)"
+                        from absurd.spawn_task(?, ?, ?::jsonb, ?::jsonb)"
                        queue task-name (json/->jsonb params) (json/->jsonb options)])))
 
 (defn retry-task!
@@ -112,7 +151,7 @@
   [conn queue task-id options]
   (spawn-row
     (execute-one conn ["select task_id, run_id, attempt, created
-                        from absurd.retry_task(?, ?::uuid, ?)"
+                        from absurd.retry_task(?, ?::uuid, ?::jsonb)"
                        queue task-id (json/->jsonb options)])))
 
 (defn cancel-task!
@@ -144,13 +183,13 @@
               (update :event-payload json/<-jsonb)))
         (execute conn ["select run_id, task_id, attempt, task_name, params, retry_strategy,
                                max_attempts, headers, wake_event, event_payload
-                        from absurd.claim_task(?, ?, ?, ?)"
+                        from absurd.claim_task(?, ?, ?::integer, ?::integer)"
                        queue worker-id (int claim-timeout) (int qty)])))
 
 (defn complete-run!
   [conn queue run-id result]
   (with-task-state-errors
-    (execute-one conn ["select absurd.complete_run(?, ?::uuid, ?)"
+    (execute-one conn ["select absurd.complete_run(?, ?::uuid, ?::jsonb)"
                        queue run-id (json/->jsonb result)]))
   nil)
 
@@ -158,7 +197,7 @@
   "`failure` is the JSON failure payload map."
   [conn queue run-id failure]
   (with-task-state-errors
-    (execute-one conn ["select absurd.fail_run(?, ?::uuid, ?)"
+    (execute-one conn ["select absurd.fail_run(?, ?::uuid, ?::jsonb)"
                        queue run-id (json/->jsonb failure)]))
   nil)
 
@@ -173,7 +212,7 @@
 (defn extend-claim!
   [conn queue run-id seconds]
   (with-task-state-errors
-    (execute-one conn ["select absurd.extend_claim(?, ?::uuid, ?)"
+    (execute-one conn ["select absurd.extend_claim(?, ?::uuid, ?::integer)"
                        queue run-id (int seconds)]))
   nil)
 
@@ -189,7 +228,7 @@
 (defn set-task-checkpoint-state!
   [conn queue task-id checkpoint-name value run-id extend-by]
   (with-task-state-errors
-    (execute-one conn ["select absurd.set_task_checkpoint_state(?, ?::uuid, ?, ?, ?::uuid, ?::integer)"
+    (execute-one conn ["select absurd.set_task_checkpoint_state(?, ?::uuid, ?, ?::jsonb, ?::uuid, ?::integer)"
                        queue task-id checkpoint-name (json/->jsonb value) run-id
                        (some-> extend-by int)]))
   nil)
@@ -224,12 +263,13 @@
 
 (defn emit-event!
   [conn queue event-name payload]
-  (execute-one conn ["select absurd.emit_event(?, ?, ?)" queue event-name (json/->jsonb payload)])
+  (execute-one conn ["select absurd.emit_event(?, ?, ?::jsonb)" queue event-name (json/->jsonb payload)])
   nil)
 
 ;; Time
 
 (defn current-time
-  "The database clock as an Instant, honouring `absurd.fake_now`."
-  ^Instant [conn]
+  "The database clock, honouring `absurd.fake_now`: an `Instant` on the JVM,
+  a Go `time.Time` under let-go."
+  [conn]
   (->instant (:t (execute-one conn ["select absurd.current_time() as t"]))))
