@@ -131,3 +131,41 @@
             (let [updated (absurd/get-queue-policy app queue)]
               (is (= "01:12:01" (:cleanup-ttl updated)))
               (is (= 12 (:cleanup-limit updated)))))))
+
+(deftest sqlite-queue-policy-stores-intervals-verbatim
+  (h/only :sqlite
+          (let [app (absurd/client (merge (h/client-opts) {:queue "default"}))
+                queue (h/random-queue "policy")]
+            (absurd/create-queue! app queue {:partition-lookahead "35 days"
+                                             :partition-lookback "2 days"
+                                             :cleanup-ttl "12345 seconds"
+                                             :cleanup-limit 77
+                                             :detach-mode :empty
+                                             :detach-min-age "45 days"})
+            (let [policy (absurd/get-queue-policy app queue)]
+              (is (= :unpartitioned (:storage-mode policy)))
+              (is (= "12345 seconds" (:cleanup-ttl policy)) "Postgres would normalize this to 03:25:45")
+              (is (= "35 days" (:partition-lookahead policy)))
+              (is (= 77 (:cleanup-limit policy))))
+            (absurd/set-queue-policy! app queue {:cleanup-ttl "4321 seconds"})
+            (is (= "4321 seconds" (:cleanup-ttl (absurd/get-queue-policy app queue))))
+            (testing "intervals outside the supported grammar are rejected"
+              (is (thrown-with-msg? java.sql.SQLException #"Invalid interval value \"3:25:45\" for cleanup_ttl"
+                                    (absurd/set-queue-policy! app queue {:cleanup-ttl "3:25:45"})))
+              (is (thrown-with-msg? java.sql.SQLException #"Invalid interval value \"-1 days\" for cleanup_ttl"
+                                    (absurd/set-queue-policy! app queue {:cleanup-ttl "-1 days"})))))))
+
+(deftest partitioned-queues-are-rejected-on-sqlite
+  (h/only :sqlite
+          (let [app (absurd/client (merge (h/client-opts) {:queue "default"}))
+                queue (h/random-queue "partitioned")]
+            (is (thrown-with-msg? java.sql.SQLException #"Partitioned queues are not supported on SQLite"
+                                  (absurd/create-queue! app queue {:storage-mode :partitioned})))
+            (is (nil? (absurd/get-queue-policy app queue)) "nothing was created"))))
+
+(deftest sqlite-client-keeps-the-database-it-was-given
+  (h/only :sqlite
+          (let [app (absurd/client (merge (h/client-opts) {:queue "default"}))]
+            (is (= :sqlite (:backend app)))
+            (is (identical? h/*conn* (:db app)))
+            (is (false? (:owned-db? app))))))
