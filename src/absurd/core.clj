@@ -5,6 +5,7 @@
   A client is an open map built by `client`. Handlers are plain functions
   `(fn [params ctx] ...)`. Every context operation takes the context first."
   (:require [absurd.json :as json]
+            [absurd.sqlite :as sqlite]
             [absurd.store :as store]
             [clojure.stacktrace :as stacktrace]
             [clojure.string :as str]
@@ -76,15 +77,40 @@
     :else
     (str "jdbc:postgresql://localhost/" s)))
 
-(defn- ->connectable
+(def ^:private sqlite-url-prefix "jdbc:sqlite:")
+
+(defn- sqlite-url?
   [db]
+  (and (string? db) (str/starts-with? db sqlite-url-prefix)))
+
+(defn- resolve-backend
+  "The backend to use: `backend` when given, else `:sqlite` for a
+  `jdbc:sqlite:` URL and `:postgres` for everything else."
+  [backend db]
   (cond
-    (nil? db) (jdbc/get-datasource (->jdbc-url (resolve-database-url)))
-    (string? db) (jdbc/get-datasource (->jdbc-url db))
-    (instance? Connection db) db
-    (instance? DataSource db) db
-    :else (fail "Unsupported :db value; expected a DataSource, Connection, URL string or nil"
-                :absurd/invalid-db {:db db})))
+    (nil? backend) (if (sqlite-url? db) :sqlite :postgres)
+    (contains? #{:postgres :sqlite} backend) backend
+    :else (fail "Unsupported :backend; expected :postgres or :sqlite"
+                :absurd/invalid-backend {:backend backend})))
+
+(defn- ->connectable
+  [backend db]
+  (let [invalid-db #(fail "Unsupported :db value; expected a DataSource, Connection, URL string or nil"
+                          :absurd/invalid-db {:db db})]
+    (cond
+      (instance? Connection db) db
+      (instance? DataSource db) db
+
+      (= :sqlite backend)
+      (cond
+        (nil? db) (fail "A SQLite client needs :db; there is no environment fallback"
+                        :absurd/invalid-db {:db db})
+        (sqlite-url? db) (jdbc/get-datasource {:jdbcUrl db})
+        :else (invalid-db))
+
+      (nil? db) (jdbc/get-datasource (->jdbc-url (resolve-database-url)))
+      (string? db) (jdbc/get-datasource (->jdbc-url db))
+      :else (invalid-db))))
 
 ;; Validation
 
@@ -120,21 +146,31 @@
 
   | key            | default              | meaning |
   |----------------|----------------------|---------|
-  | `:db`          | env-resolved URL     | DataSource, Connection, URL string or nil |
+  | `:db`          | env-resolved URL     | DataSource, Connection, URL string or nil (nil needs the Postgres backend) |
+  | `:backend`     | inferred             | `:postgres` or `:sqlite`; a `jdbc:sqlite:` URL infers `:sqlite`, everything else `:postgres` |
   | `:queue`       | `\"default\"`        | default queue |
   | `:max-attempts`| `5`                  | default retry limit |
   | `:hooks`       | `{}`                 | `:before-spawn`, `:wrap-task-execution`, `:on-lease-timeout` |
-  | `:now-fn`      | `Instant/now`        | clock used for sleeps |"
+  | `:now-fn`      | `Instant/now`        | clock used for sleeps |
+  | `:db-now-fn`   | `Instant/now`        | SQLite only: the engine clock, standing in for `absurd.current_time()` |
+
+  A DataSource or Connection for SQLite needs `:backend :sqlite`. The client
+  never connects in its constructor."
   ([] (client {}))
-  ([{:keys [db queue max-attempts hooks now-fn]
+  ([{:keys [db backend queue max-attempts hooks now-fn db-now-fn]
      :or {queue "default"
           max-attempts 5
           hooks {}
-          now-fn #(Instant/now)}}]
+          now-fn #(Instant/now)
+          db-now-fn #(Instant/now)}}]
    (validate-queue-name queue)
-   (let [connectable (->connectable db)]
+   (let [backend (resolve-backend backend db)
+         connectable (->connectable backend db)]
      {:db connectable
-      :store (store/postgres-store connectable)
+      :backend backend
+      :store (case backend
+               :postgres (store/postgres-store connectable)
+               :sqlite (sqlite/store connectable {:db-now-fn db-now-fn}))
       :owned-db? (or (nil? db) (string? db))
       :queue queue
       :max-attempts max-attempts
