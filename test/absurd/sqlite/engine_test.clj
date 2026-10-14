@@ -278,18 +278,18 @@
           :detach-min-age "30 days"}
          (tx #(engine/get-queue-policy % t0 "q"))))
   (is (nil? (tx #(engine/get-queue-policy % t0 "missing"))))
-  (tx #(engine/set-queue-policy! % t0 "q" {"cleanup_ttl" "12345 seconds"
-                                           "cleanup_limit" 7
-                                           "detach_mode" " EMPTY "
-                                           "partition_lookahead" "2 Weeks"}))
+  (tx #(engine/set-queue-policy % t0 "q" {"cleanup_ttl" "12345 seconds"
+                                          "cleanup_limit" 7
+                                          "detach_mode" " EMPTY "
+                                          "partition_lookahead" "2 Weeks"}))
   (let [policy (tx #(engine/get-queue-policy % t0 "q"))]
     (is (= "12345 seconds" (:cleanup-ttl policy)) "stored as given, not normalized")
     (is (= "2 Weeks" (:partition-lookahead policy)))
     (is (= 7 (:cleanup-limit policy)))
     (is (= "empty" (:detach-mode policy))))
   (testing "an empty policy is a no-op"
-    (tx #(engine/set-queue-policy! % t0 "q" {}))
-    (tx #(engine/set-queue-policy! % t0 "q" nil))
+    (tx #(engine/set-queue-policy % t0 "q" {}))
+    (tx #(engine/set-queue-policy % t0 "q" nil))
     (is (= 7 (:cleanup-limit (tx #(engine/get-queue-policy % t0 "q")))))))
 
 (deftest queue-policy-validation
@@ -305,14 +305,14 @@
            [{"default_partition" "enabled"} "default_partition policy is only supported for partitioned queues"]
            [[1 2] "Queue policy must be a JSON object"]]]
     (testing (pr-str policy)
-      (let [e (exception-of #(tx (fn [c] (engine/set-queue-policy! c t0 "q" policy))))]
+      (let [e (exception-of #(tx (fn [c] (engine/set-queue-policy c t0 "q" policy))))]
         (is (= message (ex-message e))))))
   (is (= "Queue \"missing\" does not exist"
-         (ex-message (exception-of #(tx (fn [c] (engine/set-queue-policy! c t0 "missing" {"cleanup_limit" 5}))))))
+         (ex-message (exception-of #(tx (fn [c] (engine/set-queue-policy c t0 "missing" {"cleanup_limit" 5}))))))
       "the queue must exist")
   (testing "a rejected policy changes nothing"
-    (is (thrown? SQLException (tx #(engine/set-queue-policy! % t0 "q" {"cleanup_limit" 5
-                                                                       "detach_mode" "sometimes"}))))
+    (is (thrown? SQLException (tx #(engine/set-queue-policy % t0 "q" {"cleanup_limit" 5
+                                                                      "detach_mode" "sometimes"}))))
     (is (= 1000 (:cleanup-limit (tx #(engine/get-queue-policy % t0 "q")))))))
 
 (deftest spawn-task-creates-a-pending-task-and-its-first-run
@@ -886,3 +886,320 @@
              (select-keys fresh [:task-name :params :headers :retry-strategy :max-attempts
                                  :cancellation :state :enqueue-at])))
       (is (= "failed" (:state (task-row task-id))) "the original task is untouched"))))
+
+;; Checkpoints and events
+
+(defn- checkpoint!
+  ([task-id run-id step value] (checkpoint! t0 task-id run-id step value nil))
+  ([now task-id run-id step value extend-by]
+   (tx #(engine/set-task-checkpoint-state % now "q" task-id step value run-id extend-by))))
+
+(defn- checkpoint-row
+  [task-id step]
+  (first (query "select * from absurd_checkpoints where task_id = ? and checkpoint_name = ?" task-id step)))
+
+(defn- await!
+  ([now task-id run-id event] (await! now task-id run-id event nil))
+  ([now task-id run-id event timeout]
+   (tx #(engine/await-event % now "q" task-id run-id (str "$awaitEvent:" event) event timeout))))
+
+(defn- emit!
+  [now event payload]
+  (tx #(engine/emit-event % now "q" event payload)))
+
+(defn- event-row
+  [event]
+  (first (query "select * from absurd_events where event_name = ?" event)))
+
+(defn- claimed-task!
+  "Spawn and claim a task at `t0`; returns the spawn result."
+  ([] (claimed-task! nil))
+  ([options]
+   (let [spawned (spawn! t0 options)]
+     (claim! t0 1 600)
+     spawned)))
+
+(deftest set-task-checkpoint-state-writes-and-reads-a-checkpoint
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task!)]
+    (checkpoint! (+ t0 5) task-id run-id "step-1" {:ok true} nil)
+    (is (= {:state "{\"ok\":true}"
+            :status "committed"
+            :owner-run-id run-id
+            :updated-at (+ t0 5)}
+           (select-keys (checkpoint-row task-id "step-1") [:state :status :owner-run-id :updated-at])))
+    (is (= {:checkpoint-name "step-1"
+            :state {:ok true}
+            :status "committed"
+            :owner-run-id run-id
+            :updated-at (engine/ms->instant (+ t0 5))}
+           (tx #(engine/get-task-checkpoint-state % t0 "q" task-id "step-1"))))
+    (is (nil? (tx #(engine/get-task-checkpoint-state % t0 "q" task-id "missing"))))
+    (testing "the same run can overwrite its own checkpoint"
+      (checkpoint! (+ t0 6) task-id run-id "step-1" {:ok false} nil)
+      (is (= {:ok false} (:state (tx #(engine/get-task-checkpoint-state % t0 "q" task-id "step-1"))))))
+    (testing "a nil value is the JSON text null, and still counts as a checkpoint"
+      (checkpoint! task-id run-id "nothing" nil)
+      (is (= "null" (:state (checkpoint-row task-id "nothing"))))
+      (is (= {:state nil}
+             (select-keys (tx #(engine/get-task-checkpoint-state % t0 "q" task-id "nothing")) [:state]))))))
+
+(deftest set-task-checkpoint-state-validates-the-run-and-task
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task! {"max_attempts" 1})
+        write! #(tx (fn [c] (engine/set-task-checkpoint-state c t0 "q" task-id %1 %3 %2 nil)))]
+    (is (= "step_name must be provided" (message #(write! "  " run-id 1))))
+    (is (= "step_name must be provided" (message #(write! nil run-id 1))))
+    (let [unknown (str (random-uuid))]
+      (is (= (str "Run \"" unknown "\" not found for checkpoint") (message #(write! "s" unknown 1)))))
+    (testing "a failed run raises AB002"
+      (tx #(engine/fail-run % t0 "q" run-id {}))
+      (is (= "AB002" (sqlstate #(write! "s" run-id 1))))
+      (is (= (str "Run \"" run-id "\" has already failed in queue \"q\"") (message #(write! "s" run-id 1)))))
+    (testing "a cancelled task raises AB001"
+      (let [other (claimed-task!)]
+        (tx #(engine/cancel-task % t0 "q" (:task-id other)))
+        (let [f #(tx (fn [c] (engine/set-task-checkpoint-state c t0 "q" (:task-id other) "s" 1 (:run-id other) 60)))]
+          (is (= "AB001" (sqlstate f)))
+          (is (= "Task has been cancelled" (message f))))))
+    (is (zero? (:n (first (query "select count(*) as n from absurd_checkpoints")))) "nothing was written")))
+
+(deftest set-task-checkpoint-state-extends-the-claim-when-asked
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task!)]
+    (is (= (+ t0 600000) (:claim-expires-at (run-row run-id))))
+    (checkpoint! (+ t0 1000) task-id run-id "a" 1 nil)
+    (is (= (+ t0 600000) (:claim-expires-at (run-row run-id))) "no extension requested")
+    (checkpoint! (+ t0 1000) task-id run-id "b" 1 0)
+    (is (= (+ t0 600000) (:claim-expires-at (run-row run-id))) "zero does not extend")
+    (checkpoint! (+ t0 1000) task-id run-id "c" 1 30)
+    (is (= (+ t0 1000 30000) (:claim-expires-at (run-row run-id))))))
+
+(deftest a-checkpoint-from-a-later-attempt-is-not-overwritten-by-an-earlier-one
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task! {"max_attempts" 3})]
+    (tx #(engine/fail-run % t0 "q" run-id {}))
+    (let [[second-claim] (claim! t0 1 600)]
+      (is (= 2 (:attempt second-claim)))
+      (checkpoint! task-id (:run-id second-claim) "s" "from attempt 2")
+      (checkpoint! task-id (:run-id second-claim) "only-later" "kept")
+      (testing "a zombie attempt 1 write is ignored"
+        (jdbc/execute! *ds* ["update absurd_runs set state = 'running' where run_id = ?" run-id])
+        (checkpoint! task-id run-id "s" "from attempt 1")
+        (is (= {:state "\"from attempt 2\""
+                :owner-run-id (:run-id second-claim)}
+               (select-keys (checkpoint-row task-id "s") [:state :owner-run-id]))))
+      (testing "an earlier run does not see later checkpoints, a later run sees both"
+        (is (empty? (tx #(engine/get-task-checkpoint-states % t0 "q" task-id run-id))))
+        (is (= #{"s" "only-later"}
+               (set (map :checkpoint-name
+                         (tx #(engine/get-task-checkpoint-states % t0 "q" task-id (:run-id second-claim)))))))))))
+
+(deftest get-task-checkpoint-states-orders-by-update-time-and-validates-the-run
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task!)
+        other (spawn! t0)]
+    (checkpoint! (+ t0 30) task-id run-id "c" 3 nil)
+    (checkpoint! (+ t0 10) task-id run-id "a" 1 nil)
+    (checkpoint! (+ t0 20) task-id run-id "b" 2 nil)
+    (is (= [{:checkpoint-name "a"
+             :state 1
+             :status "committed"
+             :owner-run-id run-id
+             :updated-at (engine/ms->instant (+ t0 10))}
+            {:checkpoint-name "b"
+             :state 2
+             :status "committed"
+             :owner-run-id run-id
+             :updated-at (engine/ms->instant (+ t0 20))}
+            {:checkpoint-name "c"
+             :state 3
+             :status "committed"
+             :owner-run-id run-id
+             :updated-at (engine/ms->instant (+ t0 30))}]
+           (tx #(engine/get-task-checkpoint-states % t0 "q" task-id run-id))))
+    (let [unknown (str (random-uuid))]
+      (is (= (str "Run \"" unknown "\" not found in queue \"q\"")
+             (message #(tx (fn [c] (engine/get-task-checkpoint-states c t0 "q" task-id unknown)))))))
+    (is (= (str "Run \"" (:run-id other) "\" does not belong to task \"" task-id "\" in queue \"q\"")
+           (message #(tx (fn [c] (engine/get-task-checkpoint-states c t0 "q" task-id (:run-id other)))))))))
+
+(deftest await-event-suspends-the-run-and-registers-a-wait
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task!)]
+    (is (= {:should-suspend true
+            :payload nil}
+           (await! (+ t0 10) task-id run-id "ping")))
+    (is (= {:state "sleeping"
+            :claimed-by nil
+            :claim-expires-at nil
+            :available-at engine/infinity
+            :wake-event "ping"
+            :event-payload nil}
+           (select-keys (run-row run-id) [:state :claimed-by :claim-expires-at :available-at
+                                          :wake-event :event-payload])))
+    (is (= "sleeping" (:state (task-row task-id))))
+    (is (= [{:task-id task-id
+             :run-id run-id
+             :step-name "$awaitEvent:ping"
+             :event-name "ping"
+             :timeout-at nil
+             :created-at (+ t0 10)}]
+           (map #(dissoc % :queue-name) (query "select * from absurd_waits"))))
+    (testing "the not-emitted sentinel is a row with a NULL payload"
+      (is (= {:payload nil
+              :emitted-at 0}
+             (select-keys (event-row "ping") [:payload :emitted-at]))))
+    (testing "a sleeping run without a timeout is never claimed"
+      (is (empty? (claim! (+ t0 100000000000)))))))
+
+(deftest await-event-with-a-timeout-wakes-at-the-deadline
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task!)]
+    (await! (+ t0 10) task-id run-id "ping" 30)
+    (is (= (+ t0 10 30000) (:available-at (run-row run-id))))
+    (is (= (+ t0 10 30000) (:timeout-at (first (query "select timeout_at from absurd_waits")))))))
+
+(deftest await-event-validates-its-input
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task!)]
+    (is (= "event_name must be provided"
+           (message #(tx (fn [c] (engine/await-event c t0 "q" task-id run-id "s" " " nil))))))
+    (is (= "timeout must be non-negative" (message #(await! t0 task-id run-id "ping" -1))))
+    (let [unknown (str (random-uuid))]
+      (is (= (str "Run \"" unknown "\" not found while awaiting event")
+             (message #(await! t0 task-id unknown "ping")))))
+    (testing "a run that is not running cannot wait"
+      (await! t0 task-id run-id "ping")
+      (is (= (str "Run \"" run-id "\" must be running to await events")
+             (message #(tx (fn [c] (engine/await-event c t0 "q" task-id run-id "other-step" "pong" nil)))))))
+    (testing "a cancelled task raises AB001"
+      (let [other (claimed-task!)]
+        (tx #(engine/cancel-task % t0 "q" (:task-id other)))
+        (is (= "AB001" (sqlstate #(await! t0 (:task-id other) (:run-id other) "ping"))))))))
+
+(deftest emit-event-wakes-the-waiter-writes-the-checkpoint-and-deletes-the-wait
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task!)]
+    (await! (+ t0 10) task-id run-id "ping" 600)
+    (emit! (+ t0 20) "ping" {:n 1})
+    (is (= {:payload "{\"n\":1}"
+            :emitted-at (+ t0 20)}
+           (select-keys (event-row "ping") [:payload :emitted-at])))
+    (is (= {:state "pending"
+            :available-at (+ t0 20)
+            :wake-event nil
+            :event-payload "{\"n\":1}"
+            :claimed-by nil}
+           (select-keys (run-row run-id) [:state :available-at :wake-event :event-payload :claimed-by])))
+    (is (= "pending" (:state (task-row task-id))))
+    (is (= {:state "{\"n\":1}"
+            :status "committed"
+            :owner-run-id run-id
+            :updated-at (+ t0 20)}
+           (select-keys (checkpoint-row task-id "$awaitEvent:ping") [:state :status :owner-run-id :updated-at])))
+    (is (zero? (:n (first (query "select count(*) as n from absurd_waits")))))
+    (testing "the woken run is claimed with the payload and resolves the await"
+      (let [[claim] (claim! (+ t0 20) 1 600)]
+        (is (= run-id (:run-id claim)))
+        (is (nil? (:wake-event claim)))
+        (is (= {:n 1} (:event-payload claim))))
+      (is (= {:should-suspend false
+              :payload {:n 1}}
+             (await! (+ t0 30) task-id run-id "ping" 600))))))
+
+(deftest emit-event-wakes-every-waiter-of-the-event-and-only-that-event
+  (setup!)
+  (let [a (claimed-task!)
+        b (do (spawn! t0) (first (claim! t0)))
+        c (do (spawn! t0) (first (claim! t0)))]
+    (await! t0 (:task-id a) (:run-id a) "ping")
+    (await! t0 (:task-id b) (:run-id b) "ping")
+    (await! t0 (:task-id c) (:run-id c) "other")
+    (emit! (+ t0 5) "ping" "go")
+    (is (= ["pending" "pending" "sleeping"]
+           (mapv #(:state (run-row (:run-id %))) [a b c])))
+    (is (= [{:event-name "other"}] (query "select event_name from absurd_waits")))))
+
+(deftest emit-event-first-write-wins
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task!)]
+    (emit! (+ t0 1) "ping" {:value 1})
+    (emit! (+ t0 2) "ping" {:value 2})
+    (is (= {:payload "{\"value\":1}"
+            :emitted-at (+ t0 1)}
+           (select-keys (event-row "ping") [:payload :emitted-at])))
+    (testing "a later emit does not wake a run that waits afterwards"
+      (is (= {:should-suspend false
+              :payload {:value 1}}
+             (await! (+ t0 3) task-id run-id "ping")))
+      (is (= {:state "{\"value\":1}"}
+             (select-keys (checkpoint-row task-id "$awaitEvent:ping") [:state]))))))
+
+(deftest await-event-after-an-emit-resolves-immediately
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task!)]
+    (emit! t0 "early" [1 2])
+    (is (= {:should-suspend false
+            :payload [1 2]}
+           (await! (+ t0 5) task-id run-id "early")))
+    (is (= "running" (:state (run-row run-id))))
+    (is (zero? (:n (first (query "select count(*) as n from absurd_waits")))))
+    (testing "an existing checkpoint short-circuits the wait"
+      (is (= {:should-suspend false
+              :payload [1 2]}
+             (await! (+ t0 6) task-id run-id "early"))))))
+
+(deftest emit-event-ignores-waits-that-already-timed-out
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task!)]
+    (await! t0 task-id run-id "ping" 10)
+    (emit! (+ t0 10000) "ping" {:late true})
+    (is (= "sleeping" (:state (run-row run-id))) "the run still wakes by its own timeout")
+    (is (nil? (checkpoint-row task-id "$awaitEvent:ping")))
+    (is (zero? (:n (first (query "select count(*) as n from absurd_waits")))) "the expired wait is removed")))
+
+(deftest a-timed-out-wait-resumes-once-without-registering-again
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task!)]
+    (await! t0 task-id run-id "ping" 10)
+    (let [[claim] (claim! (+ t0 10000) 1 600)]
+      (is (= run-id (:run-id claim)))
+      (is (= "ping" (:wake-event claim)))
+      (is (nil? (:event-payload claim))))
+    (is (zero? (:n (first (query "select count(*) as n from absurd_waits")))) "claiming removes the timed-out wait")
+    (is (= {:should-suspend false
+            :payload nil}
+           (await! (+ t0 10001) task-id run-id "ping" 10)))
+    (is (nil? (:wake-event (run-row run-id))))
+    (is (= "running" (:state (run-row run-id))))
+    (is (zero? (:n (first (query "select count(*) as n from absurd_waits")))))
+    (is (nil? (checkpoint-row task-id "$awaitEvent:ping")) "a timeout leaves no checkpoint")))
+
+(deftest a-nil-payload-is-json-null-and-distinct-from-the-not-emitted-sentinel
+  (setup!)
+  (let [{:keys [task-id run-id]} (claimed-task!)]
+    (await! t0 task-id run-id "ping")
+    (is (nil? (:payload (event-row "ping"))) "the sentinel is SQL NULL")
+    (emit! (+ t0 5) "ping" nil)
+    (is (= "null" (:payload (event-row "ping"))) "an emitted nil is the JSON text null")
+    (is (= (+ t0 5) (:emitted-at (event-row "ping"))))
+    (is (= "pending" (:state (run-row run-id))) "the sentinel does not block the first emit")
+    (is (= "null" (:event-payload (run-row run-id))))
+    (is (= "null" (:state (checkpoint-row task-id "$awaitEvent:ping"))))
+    (testing "the woken run claims a nil payload and resolves the await"
+      (let [[claim] (claim! (+ t0 5) 1 600)]
+        (is (nil? (:wake-event claim)))
+        (is (nil? (:event-payload claim))))
+      (is (= {:should-suspend false
+              :payload nil}
+             (await! (+ t0 6) task-id run-id "ping"))))
+    (testing "a second emit is ignored"
+      (emit! (+ t0 7) "ping" {:other true})
+      (is (= "null" (:payload (event-row "ping")))))))
+
+(deftest emit-event-validates-the-name-and-the-queue
+  (setup!)
+  (is (= "event_name must be provided" (message #(emit! t0 " " 1))))
+  (is (= "event_name must be provided" (message #(emit! t0 nil 1))))
+  (is (= "42P01" (sqlstate #(tx (fn [c] (engine/emit-event c t0 "missing" "e" 1)))))))

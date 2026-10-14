@@ -375,7 +375,7 @@
   [v]
   (str/lower-case (str/trim (or (json-text v) ""))))
 
-(defn set-queue-policy!
+(defn set-queue-policy
   "Update queue policy fields from a map with snake_case keys. Intervals are
   stored verbatim. A nil or empty policy is a no-op."
   [conn _now queue policy]
@@ -794,3 +794,210 @@
            :run-id run-id
            :attempt attempt
            :created false})))))
+
+;; Checkpoints
+
+(def ^:private upsert-checkpoint-sql
+  "insert into absurd_checkpoints (queue_name, task_id, checkpoint_name, state, status, owner_run_id, updated_at)
+   values (?, ?, ?, ?, 'committed', ?, ?)
+   on conflict (queue_name, task_id, checkpoint_name)
+   do update set state = excluded.state, status = excluded.status,
+                 owner_run_id = excluded.owner_run_id, updated_at = excluded.updated_at")
+
+(defn- upsert-checkpoint!
+  "Write a committed checkpoint whose `state` is already JSON text."
+  [conn now queue task-id step-name state run-id]
+  (update! conn [upsert-checkpoint-sql queue task-id step-name state run-id now]))
+
+(defn- checkpoint-row
+  [row]
+  (-> row
+      (update :state decode-json)
+      (update :updated-at ms->instant)))
+
+(defn set-task-checkpoint-state
+  "Save a step result. A checkpoint owned by a later attempt is not
+  overwritten by an earlier one. With `extend-by` > 0 the run's lease is
+  extended as well. Raises AB001 for a cancelled task and AB002 for a failed
+  run."
+  [conn now queue task-id step-name value run-id extend-by]
+  (when (or (nil? step-name) (str/blank? step-name))
+    (raise! "step_name must be provided"))
+  (let [task-id (uuid-text task-id)
+        run-id (uuid-text run-id)
+        run (query-one conn ["select r.attempt, r.state, t.state as task_state
+                                from absurd_runs r
+                                join absurd_tasks t on t.queue_name = r.queue_name and t.task_id = r.task_id
+                               where r.queue_name = ? and r.run_id = ?" queue run-id])]
+    (when-not run
+      (raise! (str "Run \"" run-id "\" not found for checkpoint")))
+    (when (= "cancelled" (:task-state run))
+      (raise! "AB001" "Task has been cancelled"))
+    (when (= "failed" (:state run))
+      (raise! "AB002" (str "Run \"" run-id "\" has already failed in queue \"" queue "\"")))
+    (when (and extend-by (pos? extend-by))
+      (update! conn ["update absurd_runs set claim_expires_at = ?
+                       where queue_name = ? and run_id = ? and state = 'running'
+                         and claim_expires_at is not null"
+                     (+ now (* extend-by 1000)) queue run-id]))
+    (let [existing (query-one conn ["select c.owner_run_id, r.attempt
+                                       from absurd_checkpoints c
+                                       left join absurd_runs r
+                                         on r.queue_name = c.queue_name and r.run_id = c.owner_run_id
+                                      where c.queue_name = ? and c.task_id = ? and c.checkpoint_name = ?"
+                                    queue task-id step-name])]
+      (when (or (nil? (:owner-run-id existing))
+                (nil? (:attempt existing))
+                (>= (:attempt run) (:attempt existing)))
+        (upsert-checkpoint! conn now queue task-id step-name (encode-json value) run-id))
+      nil)))
+
+(defn get-task-checkpoint-state
+  "One committed checkpoint row, or nil."
+  [conn _now queue task-id step-name]
+  (some-> (query-one conn ["select checkpoint_name, state, status, owner_run_id, updated_at
+                              from absurd_checkpoints
+                             where queue_name = ? and task_id = ? and checkpoint_name = ?
+                               and status = 'committed'" queue (uuid-text task-id) step-name])
+          checkpoint-row))
+
+(defn get-task-checkpoint-states
+  "The committed checkpoints visible to a run, oldest first. Checkpoints from
+  later attempts are hidden."
+  [conn _now queue task-id run-id]
+  (let [task-id (uuid-text task-id)
+        run-id (uuid-text run-id)
+        run (query-one conn ["select task_id, attempt from absurd_runs
+                               where queue_name = ? and run_id = ?" queue run-id])]
+    (when-not run
+      (raise! (str "Run \"" run-id "\" not found in queue \"" queue "\"")))
+    (when (not= task-id (:task-id run))
+      (raise! (str "Run \"" run-id "\" does not belong to task \"" task-id "\" in queue \"" queue "\"")))
+    (mapv checkpoint-row
+          (query conn ["select c.checkpoint_name, c.state, c.status, c.owner_run_id, c.updated_at
+                          from absurd_checkpoints c
+                          left join absurd_runs owner_run
+                            on owner_run.queue_name = c.queue_name and owner_run.run_id = c.owner_run_id
+                         where c.queue_name = ? and c.task_id = ? and c.status = 'committed'
+                           and (owner_run.attempt is null or owner_run.attempt <= ?)
+                         order by c.updated_at, c.rowid" queue task-id (:attempt run)]))))
+
+;; Events
+
+(defn await-event
+  "Wait for an event: resolve at once from an existing checkpoint or emitted
+  event, or put the run to sleep until the event or `timeout` seconds pass.
+  Returns `{:should-suspend bool :payload v}`.
+
+  A run resumed by its timeout has `wake_event` set and no payload; that case
+  returns `{:should-suspend false :payload nil}` without registering the wait
+  again."
+  [conn now queue task-id run-id step-name event-name timeout]
+  (when (or (nil? event-name) (str/blank? event-name))
+    (raise! "event_name must be provided"))
+  (when (and timeout (neg? timeout))
+    (raise! "timeout must be non-negative"))
+  (let [task-id (uuid-text task-id)
+        run-id (uuid-text run-id)
+        timeout-at (when timeout (+ now (* timeout 1000)))
+        checkpoint (query-one conn ["select state from absurd_checkpoints
+                                      where queue_name = ? and task_id = ? and checkpoint_name = ?"
+                                    queue task-id step-name])]
+    (if (some? (:state checkpoint))
+      {:should-suspend false
+       :payload (decode-json (:state checkpoint))}
+      (do
+        ;; A row with a NULL payload marks "not emitted yet"; emit-event always
+        ;; writes non-NULL JSON, at minimum the text null.
+        (update! conn ["insert or ignore into absurd_events (queue_name, event_name, payload, emitted_at)
+                        values (?, ?, null, 0)" queue event-name])
+        (let [run (query-one conn ["select r.state, r.event_payload, r.wake_event, t.state as task_state
+                                      from absurd_runs r
+                                      join absurd_tasks t on t.queue_name = r.queue_name and t.task_id = r.task_id
+                                     where r.queue_name = ? and r.run_id = ?" queue run-id])]
+          (when-not run
+            (raise! (str "Run \"" run-id "\" not found while awaiting event")))
+          (when (= "cancelled" (:task-state run))
+            (raise! "AB001" "Task has been cancelled"))
+          (let [event-payload (:payload (query-one conn ["select payload from absurd_events
+                                                           where queue_name = ? and event_name = ?"
+                                                         queue event-name]))
+                existing (:event-payload run)
+                _ (when existing
+                    (update! conn ["update absurd_runs set event_payload = null
+                                     where queue_name = ? and run_id = ?" queue run-id]))
+                resolved (when (and existing event-payload
+                                    (= (decode-json event-payload) (decode-json existing)))
+                           existing)]
+            (when (not= "running" (:state run))
+              (raise! (str "Run \"" run-id "\" must be running to await events")))
+            (let [resolved (or resolved event-payload)]
+              (cond
+                resolved
+                (do (upsert-checkpoint! conn now queue task-id step-name resolved run-id)
+                    {:should-suspend false
+                     :payload (decode-json resolved)})
+
+                ;; Resumed by the timeout: do not sleep again or register a new wait.
+                (and (= event-name (:wake-event run)) (nil? existing))
+                (do (update! conn ["update absurd_runs set wake_event = null
+                                     where queue_name = ? and run_id = ?" queue run-id])
+                    {:should-suspend false
+                     :payload nil})
+
+                :else
+                (do (update! conn ["insert into absurd_waits (queue_name, task_id, run_id, step_name,
+                                                              event_name, timeout_at, created_at)
+                                    values (?, ?, ?, ?, ?, ?, ?)
+                                    on conflict (queue_name, run_id, step_name)
+                                    do update set event_name = excluded.event_name,
+                                                  timeout_at = excluded.timeout_at,
+                                                  created_at = excluded.created_at"
+                                   queue task-id run-id step-name event-name timeout-at now])
+                    (update! conn ["update absurd_runs
+                                       set state = 'sleeping', claimed_by = null, claim_expires_at = null,
+                                           available_at = ?, wake_event = ?, event_payload = null
+                                     where queue_name = ? and run_id = ?"
+                                   (or timeout-at infinity) event-name queue run-id])
+                    (update! conn ["update absurd_tasks set state = 'sleeping'
+                                     where queue_name = ? and task_id = ?" queue task-id])
+                    {:should-suspend true
+                     :payload nil})))))))))
+
+(defn emit-event
+  "Emit an event. The first emit per name wins; later ones change nothing.
+  Waiters whose timeout has not passed wake up with the payload and get it
+  saved as their step checkpoint; waits that already timed out are dropped."
+  [conn now queue event-name payload]
+  (when (or (nil? event-name) (str/blank? event-name))
+    (raise! "event_name must be provided"))
+  (require-queue! conn queue)
+  (let [payload (encode-json payload)
+        applied (update! conn ["insert into absurd_events (queue_name, event_name, payload, emitted_at)
+                                values (?, ?, ?, ?)
+                                on conflict (queue_name, event_name)
+                                do update set payload = excluded.payload,
+                                              emitted_at = excluded.emitted_at
+                                 where absurd_events.payload is null"
+                               queue event-name payload now])]
+    (when (pos? applied)
+      (update! conn ["delete from absurd_waits
+                       where queue_name = ? and event_name = ?
+                         and timeout_at is not null and timeout_at <= ?" queue event-name now])
+      (doseq [{:keys [run-id task-id step-name]}
+              (query conn ["select w.run_id, w.task_id, w.step_name
+                              from absurd_waits w
+                              join absurd_runs r on r.queue_name = w.queue_name and r.run_id = w.run_id
+                             where w.queue_name = ? and w.event_name = ? and r.state = 'sleeping'"
+                           queue event-name])]
+        (update! conn ["update absurd_runs
+                           set state = 'pending', available_at = ?, wake_event = null,
+                               event_payload = ?, claimed_by = null, claim_expires_at = null
+                         where queue_name = ? and run_id = ?" now payload queue run-id])
+        (upsert-checkpoint! conn now queue task-id step-name payload run-id)
+        (update! conn ["update absurd_tasks set state = 'pending'
+                         where queue_name = ? and task_id = ?" queue task-id])
+        (update! conn ["delete from absurd_waits
+                         where queue_name = ? and event_name = ? and run_id = ?"
+                       queue event-name run-id])))
+    nil))
