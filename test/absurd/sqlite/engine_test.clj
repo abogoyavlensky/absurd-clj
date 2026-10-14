@@ -440,3 +440,437 @@
               :result nil
               :failure-reason nil}
              (tx #(engine/get-task-result % t0 "q" task-id)))))))
+
+;; Claims, run lifecycle, cancel and retry
+
+(defn- spawn!
+  "Spawn a task on queue `q` at `now`; returns the spawn result."
+  ([now] (spawn! now nil))
+  ([now options] (spawn! now "t" options))
+  ([now task-name options]
+   (tx #(engine/spawn-task % now "q" task-name {:n 1} options))))
+
+(defn- claim!
+  ([now] (claim! now 1))
+  ([now qty] (claim! now qty 60))
+  ([now qty timeout] (tx #(engine/claim-tasks % now "q" "w1" timeout qty))))
+
+(defn- task-row
+  [task-id]
+  (first (query "select * from absurd_tasks where task_id = ?" task-id)))
+
+(defn- run-row
+  [run-id]
+  (first (query "select * from absurd_runs where run_id = ?" run-id)))
+
+(defn- runs-of
+  [task-id]
+  (query "select * from absurd_runs where task_id = ? order by attempt" task-id))
+
+(defn- sqlstate
+  [f]
+  (some-> (exception-of f) .getSQLState))
+
+(defn- message
+  [f]
+  (some-> (exception-of f) ex-message))
+
+(defn- delay-run!
+  "Make a pending run not due until `at`."
+  [run-id at]
+  (jdbc/execute! *ds* ["update absurd_runs set available_at = ? where run_id = ?" at run-id]))
+
+(deftest claim-tasks-honours-qty-and-availability-and-marks-runs-running
+  (setup!)
+  (let [a (spawn! t0)
+        b (spawn! (+ t0 1))
+        c (spawn! (+ t0 2))
+        later (spawn! (+ t0 3))]
+    (delay-run! (:run-id later) (+ t0 1000))
+    (testing "only the first qty runs are claimed, oldest first"
+      (let [claims (claim! (+ t0 10) 2 120)]
+        (is (= [(:run-id a) (:run-id b)] (mapv :run-id claims)))
+        (is (= {:run-id (:run-id a)
+                :task-id (:task-id a)
+                :attempt 1
+                :task-name "t"
+                :params {:n 1}
+                :retry-strategy nil
+                :max-attempts nil
+                :headers nil
+                :wake-event nil
+                :event-payload nil}
+               (first claims)))))
+    (testing "claimed runs are running with a lease"
+      (is (= {:state "running"
+              :claimed-by "w1"
+              :claim-expires-at (+ t0 10 120000)
+              :started-at (+ t0 10)
+              :available-at (+ t0 10)}
+             (select-keys (run-row (:run-id a)) [:state :claimed-by :claim-expires-at :started-at :available-at])))
+      (is (= {:state "running"
+              :attempts 1
+              :first-started-at (+ t0 10)
+              :last-attempt-run (:run-id a)}
+             (select-keys (task-row (:task-id a)) [:state :attempts :first-started-at :last-attempt-run]))))
+    (testing "a run that is not due yet is left alone until available_at"
+      (is (= [(:run-id c)] (mapv :run-id (claim! (+ t0 11) 5))))
+      (is (empty? (claim! (+ t0 999) 5)))
+      (is (= [(:run-id later)] (mapv :run-id (claim! (+ t0 1000) 5)))))
+    (testing "nothing is left to claim"
+      (is (empty? (claim! (+ t0 2000) 5))))
+    (testing "a sleeping run waits until its wake time"
+      (let [d (spawn! (+ t0 3000))]
+        (claim! (+ t0 3000))
+        (tx #(engine/schedule-run-after % (+ t0 3000) "q" (:run-id d) 30))
+        (is (empty? (claim! (+ t0 3000 29999) 1)))
+        (is (= [(:run-id d)] (mapv :run-id (claim! (+ t0 3000 30000) 1))))))))
+
+(deftest claim-tasks-with-a-zero-timeout-has-no-lease-and-defaults-the-worker
+  (setup!)
+  (let [spawned (spawn! t0)]
+    (is (= 1 (count (tx #(engine/claim-tasks % t0 "q" "" 0 0)))))
+    (is (= {:claimed-by "worker"
+            :claim-expires-at nil}
+           (select-keys (run-row (:run-id spawned)) [:claimed-by :claim-expires-at])))))
+
+(deftest claim-tasks-on-a-missing-queue-is-an-error
+  (setup!)
+  (is (= "42P01" (sqlstate #(tx (fn [c] (engine/claim-tasks c t0 "missing" "w" 60 1)))))))
+
+(deftest claim-tasks-fails-an-expired-lease-with-claim-timeout-and-retries
+  (setup!)
+  (let [spawned (spawn! t0 {"max_attempts" 3})
+        [claim] (claim! t0 1 10)]
+    (is (= (:run-id spawned) (:run-id claim)))
+    (testing "a lease that has not expired is left alone"
+      (is (empty? (claim! (+ t0 9999) 1))))
+    (testing "an expired lease fails the run and the retry is claimed in the same call"
+      (let [[retry] (claim! (+ t0 10000) 1)
+            failed (run-row (:run-id spawned))]
+        (is (= (:task-id spawned) (:task-id retry)))
+        (is (= 2 (:attempt retry)))
+        (is (not= (:run-id spawned) (:run-id retry)))
+        (is (= "failed" (:state failed)))
+        (is (= {:name "$ClaimTimeout"
+                :message "worker did not finish task within claim interval"
+                :workerId "w1"
+                :claimExpiredAt (str (engine/ms->instant (+ t0 10000)))
+                :attempt 1}
+               (engine/decode-json (:failure-reason failed))))
+        (is (= {:state "running"
+                :attempts 2}
+               (select-keys (task-row (:task-id spawned)) [:state :attempts])))))))
+
+(deftest claim-tasks-fails-the-task-when-an-expired-lease-was-the-last-attempt
+  (setup!)
+  (let [spawned (spawn! t0 {"max_attempts" 1})]
+    (claim! t0 1 10)
+    (is (empty? (claim! (+ t0 10000) 1)))
+    (is (= "failed" (:state (task-row (:task-id spawned)))))))
+
+(deftest claim-tasks-bounds-the-expired-lease-sweep-by-qty
+  (setup!)
+  (let [spawned (mapv #(spawn! (+ t0 %)) (range 3))]
+    (claim! (+ t0 5) 3 10)
+    (claim! (+ t0 20000) 1 10)
+    (is (= 1 (count (filter #(= "failed" (:state (run-row (:run-id %)))) spawned)))
+        "one expired lease per requested claim")))
+
+(deftest claim-tasks-applies-max-delay-before-claiming
+  (setup!)
+  (let [delayed (spawn! t0 {"cancellation" {"max_delay" 60}})]
+    (delay-run! (:run-id delayed) (+ t0 1000000))
+    (is (empty? (claim! (+ t0 59999))))
+    (is (= "pending" (:state (task-row (:task-id delayed)))) "still within max_delay")
+    (is (empty? (claim! (+ t0 60000))))
+    (is (= {:state "cancelled"
+            :cancelled-at (+ t0 60000)}
+           (select-keys (task-row (:task-id delayed)) [:state :cancelled-at])))
+    (is (= "cancelled" (:state (run-row (:run-id delayed)))))))
+
+(deftest claim-tasks-applies-max-duration-to-a-running-task
+  (setup!)
+  (let [timed (spawn! t0 {"cancellation" {"max_duration" 10}})]
+    (claim! t0 1 600)
+    (is (= "running" (:state (run-row (:run-id timed)))))
+    (claim! (+ t0 9999))
+    (is (= "running" (:state (task-row (:task-id timed)))) "still within max_duration")
+    (claim! (+ t0 10000))
+    (is (= "cancelled" (:state (task-row (:task-id timed)))))
+    (is (= {:state "cancelled"
+            :claimed-by nil
+            :claim-expires-at nil}
+           (select-keys (run-row (:run-id timed)) [:state :claimed-by :claim-expires-at])))))
+
+(deftest complete-run-stores-the-result-and-completes-the-task
+  (setup!)
+  (let [{:keys [task-id run-id]} (spawn! t0)]
+    (claim! t0)
+    (tx #(engine/complete-run % (+ t0 5) "q" run-id {:done true}))
+    (is (= {:state "completed"
+            :completed-at (+ t0 5)
+            :result "{\"done\":true}"}
+           (select-keys (run-row run-id) [:state :completed-at :result])))
+    (is (= {:state "completed"
+            :completed-payload "{\"done\":true}"
+            :last-attempt-run run-id}
+           (select-keys (task-row task-id) [:state :completed-payload :last-attempt-run])))
+    (testing "a nil result is the JSON text null"
+      (let [other (spawn! t0)]
+        (claim! t0)
+        (tx #(engine/complete-run % t0 "q" (:run-id other) nil))
+        (is (= "null" (:result (run-row (:run-id other)))))))))
+
+(deftest complete-run-rejects-runs-that-are-not-running
+  (setup!)
+  (let [{:keys [task-id run-id]} (spawn! t0 {"max_attempts" 1})
+        complete! #(tx (fn [c] (engine/complete-run c t0 "q" run-id {})))]
+    (is (= "Run \"" (subs (message complete!) 0 5)))
+    (is (= (str "Run \"" run-id "\" is not currently running in queue \"q\"") (message complete!)))
+    (claim! t0)
+    (tx #(engine/fail-run % t0 "q" run-id {:name "E"}))
+    (is (= "AB002" (sqlstate complete!)))
+    (is (= (str "Run \"" run-id "\" has already failed in queue \"q\"") (message complete!)))
+    (testing "a cancelled run raises AB001"
+      (let [other (spawn! t0)]
+        (claim! t0)
+        (tx #(engine/cancel-task % t0 "q" (:task-id other)))
+        (let [f #(tx (fn [c] (engine/complete-run c t0 "q" (:run-id other) {})))]
+          (is (= "AB001" (sqlstate f)))
+          (is (= "Task has been cancelled" (message f))))))
+    (testing "an unknown run"
+      (let [unknown (str (random-uuid))]
+        (is (= (str "Run \"" unknown "\" not found in queue \"q\"")
+               (message #(tx (fn [c] (engine/complete-run c t0 "q" unknown {}))))))))
+    (is (= "failed" (:state (task-row task-id))))))
+
+(deftest fail-run-retries-with-the-strategy-delay-then-fails-the-task
+  (setup!)
+  (let [{:keys [task-id run-id]} (spawn! t0 {"max_attempts" 3
+                                             "retry_strategy" {"kind" "exponential"
+                                                               "base_seconds" 10}})]
+    (claim! t0)
+    (tx #(engine/fail-run % t0 "q" run-id {:name "E"
+                                           :message "first"}))
+    (let [[first-run second-run] (runs-of task-id)]
+      (is (= {:state "failed"
+              :failed-at t0
+              :failure-reason "{\"name\":\"E\",\"message\":\"first\"}"}
+             (select-keys first-run [:state :failed-at :failure-reason])))
+      (is (= {:attempt 2
+              :state "sleeping"
+              :available-at (+ t0 10000)}
+             (select-keys second-run [:attempt :state :available-at])))
+      (is (= {:state "sleeping"
+              :attempts 2
+              :last-attempt-run (:run-id second-run)}
+             (select-keys (task-row task-id) [:state :attempts :last-attempt-run])))
+      (testing "the second failure doubles the delay"
+        (claim! (+ t0 10000))
+        (tx #(engine/fail-run % (+ t0 10000) "q" (:run-id second-run) {:name "E"}))
+        (is (= (+ t0 10000 20000) (:available-at (nth (runs-of task-id) 2)))))
+      (testing "the last attempt fails the task"
+        (let [third (:run-id (nth (runs-of task-id) 2))]
+          (claim! (+ t0 30000))
+          (tx #(engine/fail-run % (+ t0 30000) "q" third {:name "E"}))
+          (is (= 3 (count (runs-of task-id))))
+          (is (= {:state "failed"
+                  :attempts 3
+                  :last-attempt-run third}
+                 (select-keys (task-row task-id) [:state :attempts :last-attempt-run]))))))))
+
+(deftest fail-run-without-a-strategy-retries-immediately
+  (setup!)
+  (let [{:keys [task-id run-id]} (spawn! t0)]
+    (claim! t0)
+    (tx #(engine/fail-run % t0 "q" run-id {:name "E"}))
+    (is (= {:state "pending"
+            :available-at t0}
+           (select-keys (second (runs-of task-id)) [:state :available-at])))
+    (is (= "pending" (:state (task-row task-id))))))
+
+(deftest fail-run-cancels-the-task-when-the-retry-would-exceed-max-duration
+  (setup!)
+  (let [{:keys [task-id run-id]} (spawn! t0 {"retry_strategy" {"kind" "fixed"
+                                                               "base_seconds" 30}
+                                             "cancellation" {"max_duration" 20}})]
+    (claim! t0)
+    (tx #(engine/fail-run % (+ t0 1000) "q" run-id {:name "E"}))
+    (is (= 1 (count (runs-of task-id))))
+    (is (= {:state "cancelled"
+            :cancelled-at (+ t0 1000)
+            :last-attempt-run run-id}
+           (select-keys (task-row task-id) [:state :cancelled-at :last-attempt-run])))))
+
+(deftest fail-run-with-an-invalid-stored-strategy-fails-the-task-permanently
+  (setup!)
+  (let [{:keys [task-id run-id]} (spawn! t0)]
+    (jdbc/execute! *ds* ["update absurd_tasks set retry_strategy = '{\"kind\":\"bogus\"}' where task_id = ?" task-id])
+    (claim! t0)
+    (tx #(engine/fail-run % t0 "q" run-id {:name "E"}))
+    (is (= 1 (count (runs-of task-id))))
+    (is (= "failed" (:state (task-row task-id))))))
+
+(deftest fail-run-clears-waits-and-rejects-bad-runs
+  (setup!)
+  (let [{:keys [run-id]} (spawn! t0 {"max_attempts" 1})]
+    (jdbc/execute! *ds* ["insert into absurd_waits (queue_name, task_id, run_id, step_name, event_name, created_at) values ('q', 't', ?, 's', 'e', 0)" run-id])
+    (claim! t0)
+    (tx #(engine/fail-run % t0 "q" run-id {:name "E"}))
+    (is (zero? (:n (first (query "select count(*) as n from absurd_waits")))))
+    (is (= "AB002" (sqlstate #(tx (fn [c] (engine/fail-run c t0 "q" run-id {}))))))
+    (let [unknown (str (random-uuid))]
+      (is (= (str "Run \"" unknown "\" cannot be failed in queue \"q\"")
+             (message #(tx (fn [c] (engine/fail-run c t0 "q" unknown {})))))))
+    (let [other (spawn! t0)]
+      (is (= (str "Run \"" (:run-id other) "\" cannot be failed in queue \"q\"")
+             (message #(tx (fn [c] (engine/fail-run c t0 "q" (:run-id other) {})))))
+          "a pending run cannot be failed"))))
+
+(deftest schedule-run-after-sleeps-the-run-relative-to-the-engine-clock
+  (setup!)
+  (let [{:keys [task-id run-id]} (spawn! t0)]
+    (claim! t0)
+    (tx #(engine/schedule-run-after % (+ t0 5) "q" run-id 90))
+    (is (= {:state "sleeping"
+            :claimed-by nil
+            :claim-expires-at nil
+            :available-at (+ t0 5 90000)
+            :wake-event nil}
+           (select-keys (run-row run-id) [:state :claimed-by :claim-expires-at :available-at :wake-event])))
+    (is (= "sleeping" (:state (task-row task-id))))
+    (testing "fractional seconds keep millisecond precision"
+      (let [other (spawn! t0)]
+        (claim! t0)
+        (tx #(engine/schedule-run-after % t0 "q" (:run-id other) 0.25))
+        (is (= (+ t0 250) (:available-at (run-row (:run-id other)))))))
+    (testing "only a running run can sleep"
+      (is (= (str "Run \"" run-id "\" is not currently running in queue \"q\"")
+             (message #(tx (fn [c] (engine/schedule-run-after c t0 "q" run-id 1)))))))))
+
+(deftest extend-claim-moves-the-lease-and-validates-the-run
+  (setup!)
+  (let [{:keys [run-id task-id]} (spawn! t0)]
+    (claim! t0 1 10)
+    (tx #(engine/extend-claim % (+ t0 4000) "q" run-id 30))
+    (is (= (+ t0 4000 30000) (:claim-expires-at (run-row run-id))))
+    (is (= "extend_by must be > 0" (message #(tx (fn [c] (engine/extend-claim c t0 "q" run-id 0))))))
+    (is (= "extend_by must be > 0" (message #(tx (fn [c] (engine/extend-claim c t0 "q" run-id nil))))))
+    (let [unknown (str (random-uuid))]
+      (is (= (str "Run \"" unknown "\" not found in queue \"q\"")
+             (message #(tx (fn [c] (engine/extend-claim c t0 "q" unknown 5)))))))
+    (testing "a cancelled task raises AB001"
+      (tx #(engine/cancel-task % t0 "q" task-id))
+      (is (= "AB001" (sqlstate #(tx (fn [c] (engine/extend-claim c t0 "q" run-id 5)))))))
+    (testing "a failed run raises AB002 and a pending run is not running"
+      (let [failing (spawn! t0 {"max_attempts" 1})]
+        (is (= (str "Run \"" (:run-id failing) "\" is not currently running in queue \"q\"")
+               (message #(tx (fn [c] (engine/extend-claim c t0 "q" (:run-id failing) 5))))))
+        (claim! t0)
+        (tx #(engine/fail-run % t0 "q" (:run-id failing) {}))
+        (is (= "AB002" (sqlstate #(tx (fn [c] (engine/extend-claim c t0 "q" (:run-id failing) 5))))))))))
+
+(deftest cancel-task-cancels-runs-and-clears-waits
+  (setup!)
+  (let [{:keys [task-id run-id]} (spawn! t0)]
+    (claim! t0)
+    (jdbc/execute! *ds* ["insert into absurd_waits (queue_name, task_id, run_id, step_name, event_name, created_at) values ('q', ?, ?, 's', 'e', 0)" task-id run-id])
+    (tx #(engine/cancel-task % (+ t0 7) "q" task-id))
+    (is (= {:state "cancelled"
+            :cancelled-at (+ t0 7)}
+           (select-keys (task-row task-id) [:state :cancelled-at])))
+    (is (= {:state "cancelled"
+            :claimed-by nil
+            :claim-expires-at nil}
+           (select-keys (run-row run-id) [:state :claimed-by :claim-expires-at])))
+    (is (zero? (:n (first (query "select count(*) as n from absurd_waits")))))
+    (testing "cancelling again changes nothing"
+      (tx #(engine/cancel-task % (+ t0 99) "q" task-id))
+      (is (= (+ t0 7) (:cancelled-at (task-row task-id)))))))
+
+(deftest cancel-task-is-a-noop-on-terminal-tasks-and-errors-on-unknown-ones
+  (setup!)
+  (let [done (spawn! t0)
+        failed (spawn! t0 {"max_attempts" 1})]
+    (claim! t0 2)
+    (tx #(engine/complete-run % t0 "q" (:run-id done) {}))
+    (tx #(engine/fail-run % t0 "q" (:run-id failed) {}))
+    (tx #(engine/cancel-task % t0 "q" (:task-id done)))
+    (tx #(engine/cancel-task % t0 "q" (:task-id failed)))
+    (is (= "completed" (:state (task-row (:task-id done)))))
+    (is (= "failed" (:state (task-row (:task-id failed)))))
+    (is (nil? (:cancelled-at (task-row (:task-id done)))))
+    (let [unknown (str (random-uuid))]
+      (is (= (str "Task \"" unknown "\" not found in queue \"q\"")
+             (message #(tx (fn [c] (engine/cancel-task c t0 "q" unknown)))))))))
+
+(deftest retry-task-adds-an-attempt-in-place
+  (setup!)
+  (let [{:keys [task-id run-id]} (spawn! t0 {"max_attempts" 1})]
+    (claim! t0)
+    (tx #(engine/fail-run % t0 "q" run-id {:name "E"}))
+    (let [retried (tx #(engine/retry-task % (+ t0 100) "q" task-id {}))]
+      (is (= {:task-id task-id
+              :attempt 2
+              :created false}
+             (dissoc retried :run-id)))
+      (is (= {:attempt 2
+              :state "pending"
+              :available-at (+ t0 100)}
+             (select-keys (run-row (:run-id retried)) [:attempt :state :available-at])))
+      (is (= {:state "pending"
+              :attempts 2
+              :max-attempts 2
+              :last-attempt-run (:run-id retried)
+              :cancelled-at nil}
+             (select-keys (task-row task-id) [:state :attempts :max-attempts :last-attempt-run :cancelled-at])))
+      (testing "the retried run can be claimed again"
+        (is (= [(:run-id retried)] (mapv :run-id (claim! (+ t0 100)))))))))
+
+(deftest retry-task-honours-max-attempts-and-validates-the-task
+  (setup!)
+  (let [{:keys [task-id run-id]} (spawn! t0 {"max_attempts" 2})
+        retry! (fn [options] #(tx (fn [c] (engine/retry-task c t0 "q" task-id options))))]
+    (is (= (str "Task \"" task-id "\" is not currently failed in queue \"q\"")
+           (message (retry! {}))))
+    (claim! t0)
+    (tx #(engine/fail-run % t0 "q" run-id {}))
+    (claim! t0)
+    (tx #(engine/fail-run % t0 "q" (:run-id (second (runs-of task-id))) {}))
+    (is (= "failed" (:state (task-row task-id))))
+    (is (= "max_attempts must be >= 1" (message (retry! {"max_attempts" 0}))))
+    (is (= "max_attempts (2) must be greater than current attempts (2)"
+           (message (retry! {"max_attempts" 2}))))
+    (is (= 3 (:attempt (tx #(engine/retry-task % t0 "q" task-id {"max_attempts" 5})))))
+    (is (= 5 (:max-attempts (task-row task-id))))
+    (let [unknown (str (random-uuid))]
+      (is (= (str "Task \"" unknown "\" not found in queue \"q\"")
+             (message #(tx (fn [c] (engine/retry-task c t0 "q" unknown {})))))))))
+
+(deftest retry-task-with-spawn-new-creates-a-fresh-task-from-the-original-inputs
+  (setup!)
+  (let [{:keys [task-id run-id]} (spawn! t0 "mailer" {"max_attempts" 1
+                                                      "headers" {"trace" "t1"
+                                                                 "skip" nil}
+                                                      "retry_strategy" {"kind" "fixed"}
+                                                      "cancellation" {"max_delay" 600}})]
+    (claim! t0)
+    (tx #(engine/fail-run % t0 "q" run-id {}))
+    (let [respawned (tx #(engine/retry-task % (+ t0 5) "q" task-id {"spawn_new" true
+                                                                    "max_attempts" 4}))
+          fresh (task-row (:task-id respawned))]
+      (is (true? (:created respawned)))
+      (is (= 1 (:attempt respawned)))
+      (is (not= task-id (:task-id respawned)))
+      (is (= {:task-name "mailer"
+              :params "{\"n\":1}"
+              :headers "{\"trace\":\"t1\"}"
+              :retry-strategy "{\"kind\":\"fixed\"}"
+              :max-attempts 4
+              :cancellation "{\"max_delay\":600}"
+              :state "pending"
+              :enqueue-at (+ t0 5)}
+             (select-keys fresh [:task-name :params :headers :retry-strategy :max-attempts
+                                 :cancellation :state :enqueue-at])))
+      (is (= "failed" (:state (task-row task-id))) "the original task is untouched"))))

@@ -489,3 +489,297 @@
                (decode-json (:completed-payload row)))
      :failure-reason (when (= "failed" (:state row))
                        (decode-json (:failure-reason row)))}))
+
+;; Cancellation
+
+(defn cancel-task
+  "Cancel a task and its unfinished runs and clear its event waits. A task
+  that already finished is left alone; an unknown task raises."
+  [conn now queue task-id]
+  (let [task-id (uuid-text task-id)
+        state (:state (query-one conn ["select state from absurd_tasks
+                                         where queue_name = ? and task_id = ?" queue task-id]))]
+    (when-not state
+      (raise! (str "Task \"" task-id "\" not found in queue \"" queue "\"")))
+    (when-not (contains? #{"completed" "failed" "cancelled"} state)
+      (update! conn ["update absurd_tasks
+                         set state = 'cancelled', cancelled_at = coalesce(cancelled_at, ?)
+                       where queue_name = ? and task_id = ?" now queue task-id])
+      (update! conn ["update absurd_runs
+                         set state = 'cancelled', claimed_by = null, claim_expires_at = null
+                       where queue_name = ? and task_id = ?
+                         and state not in ('completed', 'failed', 'cancelled')" queue task-id])
+      (update! conn ["delete from absurd_waits where queue_name = ? and task_id = ?" queue task-id]))
+    nil))
+
+;; Run lifecycle
+
+(defn- raise-run-state!
+  "Raise the error for a run in an unexpected `state`: AB001 for cancelled,
+  AB002 for failed, else the generic message built from `generic`."
+  [state run-id queue generic]
+  (case state
+    "cancelled" (raise! "AB001" "Task has been cancelled")
+    "failed" (raise! "AB002" (str "Run \"" run-id "\" has already failed in queue \"" queue "\""))
+    (raise! generic)))
+
+(defn complete-run
+  "Mark a running run, and its task, completed with `result`."
+  [conn now queue run-id result]
+  (let [run-id (uuid-text run-id)
+        run (query-one conn ["select task_id, state from absurd_runs
+                               where queue_name = ? and run_id = ?" queue run-id])]
+    (when-not run
+      (raise! (str "Run \"" run-id "\" not found in queue \"" queue "\"")))
+    (when (not= "running" (:state run))
+      (raise-run-state! (:state run) run-id queue
+                        (str "Run \"" run-id "\" is not currently running in queue \"" queue "\"")))
+    (let [payload (encode-json result)]
+      (update! conn ["update absurd_runs set state = 'completed', completed_at = ?, result = ?
+                       where queue_name = ? and run_id = ?" now payload queue run-id])
+      (update! conn ["update absurd_tasks
+                         set state = 'completed', completed_payload = ?, last_attempt_run = ?
+                       where queue_name = ? and task_id = ?" payload run-id queue (:task-id run)])
+      (update! conn ["delete from absurd_waits where queue_name = ? and run_id = ?" queue run-id]))
+    nil))
+
+(defn schedule-run
+  "Put a running run to sleep until `wake-at` (epoch milliseconds)."
+  [conn _now queue run-id wake-at]
+  (let [run-id (uuid-text run-id)
+        run (query-one conn ["select task_id from absurd_runs
+                               where queue_name = ? and run_id = ? and state = 'running'"
+                             queue run-id])]
+    (when-not run
+      (raise! (str "Run \"" run-id "\" is not currently running in queue \"" queue "\"")))
+    (update! conn ["update absurd_runs
+                       set state = 'sleeping', claimed_by = null, claim_expires_at = null,
+                           available_at = ?, wake_event = null
+                     where queue_name = ? and run_id = ?" wake-at queue run-id])
+    (update! conn ["update absurd_tasks set state = 'sleeping' where queue_name = ? and task_id = ?"
+                   queue (:task-id run)])
+    nil))
+
+(defn- seconds->ms
+  ^long [seconds]
+  (Math/round (* (double seconds) 1000.0)))
+
+(defn schedule-run-after
+  "Put a running run to sleep for `seconds` after the engine clock."
+  [conn now queue run-id seconds]
+  (schedule-run conn now queue run-id (+ now (seconds->ms seconds))))
+
+(defn fail-run
+  "Fail a run and, while attempts remain, schedule the next one after the retry
+  strategy's delay. A task that cannot retry fails, or is cancelled when the
+  retry would pass `max_duration`."
+  [conn now queue run-id reason]
+  (let [run-id (uuid-text run-id)
+        run (query-one conn ["select task_id, attempt, state from absurd_runs
+                               where queue_name = ? and run_id = ?" queue run-id])
+        cannot-fail (str "Run \"" run-id "\" cannot be failed in queue \"" queue "\"")]
+    (when-not run
+      (raise! cannot-fail))
+    (when (not (contains? #{"running" "sleeping"} (:state run)))
+      (raise-run-state! (:state run) run-id queue cannot-fail))
+    (let [{:keys [task-id attempt]} run
+          task (query-one conn ["select retry_strategy, max_attempts, first_started_at, cancellation
+                                   from absurd_tasks where queue_name = ? and task_id = ?"
+                                queue task-id])
+          next-attempt (inc attempt)]
+      (update! conn ["update absurd_runs
+                         set state = 'failed', wake_event = null, failed_at = ?, failure_reason = ?
+                       where queue_name = ? and run_id = ?" now (encode-json reason) queue run-id])
+      (let [retry? (or (nil? (:max-attempts task)) (<= next-attempt (:max-attempts task)))
+            ;; Legacy tasks may hold a strategy that predates validation. If it
+            ;; is invalid, fail the task permanently rather than wedging the queue.
+            next-available (when retry?
+                             (try
+                               (+ now (seconds->ms (retry-delay-seconds (decode-json (:retry-strategy task))
+                                                                        attempt)))
+                               (catch SQLException e
+                                 (if (= "AB003" (.getSQLState e)) nil (throw e)))))
+            max-duration (some-> (decode-json (:cancellation task)) :max_duration int-text)
+            cancel? (boolean (and next-available max-duration (:first-started-at task)
+                                  (>= (- next-available (:first-started-at task))
+                                      (* max-duration 1000))))
+            new-run-id (when (and next-available (not cancel?)) (uuidv7 now))
+            state-after (cond cancel? "cancelled"
+                              new-run-id (if (> next-available now) "sleeping" "pending")
+                              :else "failed")]
+        (when new-run-id
+          (insert-run! conn now queue new-run-id task-id next-attempt state-after next-available))
+        (update! conn ["update absurd_tasks
+                           set state = ?, attempts = max(attempts, ?), last_attempt_run = ?,
+                               cancelled_at = coalesce(cancelled_at, ?)
+                         where queue_name = ? and task_id = ?"
+                       state-after (if new-run-id next-attempt attempt) (or new-run-id run-id)
+                       (when cancel? now) queue task-id])
+        (update! conn ["delete from absurd_waits where queue_name = ? and run_id = ?" queue run-id])
+        nil))))
+
+(defn extend-claim
+  "Push a running run's lease `seconds` past the engine clock."
+  [conn now queue run-id seconds]
+  (when (or (nil? seconds) (<= seconds 0))
+    (raise! "extend_by must be > 0"))
+  (let [run-id (uuid-text run-id)
+        run (query-one conn ["select r.state, r.claim_expires_at, t.state as task_state
+                                from absurd_runs r
+                                join absurd_tasks t on t.queue_name = r.queue_name and t.task_id = r.task_id
+                               where r.queue_name = ? and r.run_id = ?" queue run-id])]
+    (when-not run
+      (raise! (str "Run \"" run-id "\" not found in queue \"" queue "\"")))
+    (when (= "cancelled" (:task-state run))
+      (raise! "AB001" "Task has been cancelled"))
+    (when (not= "running" (:state run))
+      (raise-run-state! (:state run) run-id queue
+                        (str "Run \"" run-id "\" is not currently running in queue \"" queue "\"")))
+    (when-not (:claim-expires-at run)
+      (raise! (str "Run \"" run-id "\" does not have an active claim in queue \"" queue "\"")))
+    (update! conn ["update absurd_runs set claim_expires_at = ? where queue_name = ? and run_id = ?"
+                   (+ now (* seconds 1000)) queue run-id])
+    nil))
+
+;; Claiming
+
+(defn- cancel-overdue-tasks!
+  "Apply `max_delay` (task never started) and `max_duration` (task started)
+  cancellation rules, using `cancel-task` so the run and task stay in step."
+  [conn now queue]
+  (doseq [{:keys [task-id]}
+          (query conn ["select task_id from absurd_tasks
+                         where queue_name = ?
+                           and state in ('pending', 'sleeping', 'running')
+                           and cancellation is not null
+                           and ((json_extract(cancellation, '$.max_delay') is not null
+                                 and first_started_at is null
+                                 and ? - enqueue_at >= json_extract(cancellation, '$.max_delay') * 1000)
+                             or (json_extract(cancellation, '$.max_duration') is not null
+                                 and first_started_at is not null
+                                 and ? - first_started_at >= json_extract(cancellation, '$.max_duration') * 1000))
+                         order by task_id" queue now now])]
+    (cancel-task conn now queue task-id)))
+
+(defn- fail-expired-leases!
+  "Fail up to `limit` runs whose lease ran out, as `$ClaimTimeout`."
+  [conn now queue limit]
+  (doseq [{:keys [run-id claimed-by claim-expires-at attempt]}
+          (query conn ["select run_id, claimed_by, claim_expires_at, attempt from absurd_runs
+                         where queue_name = ? and state = 'running'
+                           and claim_expires_at is not null and claim_expires_at <= ?
+                         order by claim_expires_at, run_id
+                         limit ?" queue now limit])]
+    (fail-run conn now queue run-id
+              (cond-> {:name "$ClaimTimeout"
+                       :message "worker did not finish task within claim interval"
+                       :claimExpiredAt (str (ms->instant claim-expires-at))
+                       :attempt attempt}
+                claimed-by (assoc :workerId claimed-by)))))
+
+(defn claim-tasks
+  "Claim up to `qty` runs for `worker-id` with a lease of `claim-timeout`
+  seconds (no lease when 0). First applies cancellation rules and fails runs
+  whose lease expired (at most `qty` of them), then claims the oldest due
+  runs. Returns the claim maps ordered by `available_at`, then run id."
+  [conn now queue worker-id claim-timeout qty]
+  (require-queue! conn queue)
+  (let [timeout (max (or claim-timeout 30) 0)
+        worker-id (if (str/blank? worker-id) "worker" worker-id)
+        qty (max (or qty 1) 1)
+        claim-until (when (pos? timeout) (+ now (* timeout 1000)))]
+    (cancel-overdue-tasks! conn now queue)
+    (fail-expired-leases! conn now queue qty)
+    (let [rows (query conn ["select r.run_id, r.task_id, r.attempt, t.task_name, t.params,
+                                    t.retry_strategy, t.max_attempts, t.headers,
+                                    r.wake_event, r.event_payload
+                               from absurd_runs r
+                               join absurd_tasks t on t.queue_name = r.queue_name and t.task_id = r.task_id
+                              where r.queue_name = ?
+                                and r.state in ('pending', 'sleeping')
+                                and t.state in ('pending', 'sleeping', 'running')
+                                and r.available_at <= ?
+                              order by r.available_at, r.run_id
+                              limit ?" queue now qty])]
+      (doseq [{:keys [run-id task-id attempt]} rows]
+        (update! conn ["update absurd_runs
+                           set state = 'running', claimed_by = ?, claim_expires_at = ?,
+                               started_at = ?, available_at = ?
+                         where queue_name = ? and run_id = ?"
+                       worker-id claim-until now now queue run-id])
+        (update! conn ["update absurd_tasks
+                           set state = 'running', attempts = max(attempts, ?),
+                               first_started_at = coalesce(first_started_at, ?), last_attempt_run = ?
+                         where queue_name = ? and task_id = ?" attempt now run-id queue task-id])
+        (update! conn ["delete from absurd_waits
+                         where queue_name = ? and run_id = ? and timeout_at is not null and timeout_at <= ?"
+                       queue run-id now]))
+      (mapv (fn [row]
+              (-> row
+                  (update :params decode-json)
+                  (update :retry-strategy decode-json)
+                  (update :headers decode-json)
+                  (update :event-payload decode-json)))
+            rows))))
+
+;; Retry
+
+(defn- strip-nils
+  "Drop object fields whose value is nil, recursively, like `jsonb_strip_nulls`."
+  [v]
+  (cond
+    (map? v) (into {} (keep (fn [[k x]] (when (some? x) [k (strip-nils x)]))) v)
+    (vector? v) (mapv strip-nils v)
+    :else v))
+
+(defn- boolean-text
+  "Cast a JSON value to a boolean like `(v->>'k')::boolean`."
+  [v]
+  (when-let [text (json-text v)]
+    (let [t (str/lower-case (str/trim text))]
+      (cond
+        (contains? #{"true" "t" "yes" "y" "on" "1"} t) true
+        (contains? #{"false" "f" "no" "n" "off" "0"} t) false
+        :else (raise! "22P02" (str "invalid input syntax for type boolean: \"" text "\""))))))
+
+(defn retry-task
+  "Retry a failed task, either in place (a new run with attempt + 1) or, with
+  `spawn_new`, as a new task copied from the original inputs. `options` takes
+  `spawn_new` and `max_attempts`."
+  [conn now queue task-id options]
+  (let [options (let [o (normalize options)] (if (map? o) o {}))
+        spawn-new? (boolean (boolean-text (:spawn_new options)))
+        requested (when (contains? options :max_attempts)
+                    (int-text (:max_attempts options)))
+        _ (when (and requested (< requested 1))
+            (raise! "max_attempts must be >= 1"))
+        task-id (uuid-text task-id)
+        task (query-one conn ["select task_name, params, headers, retry_strategy, max_attempts,
+                                      cancellation, attempts, state
+                                 from absurd_tasks where queue_name = ? and task_id = ?" queue task-id])]
+    (when-not task
+      (raise! (str "Task \"" task-id "\" not found in queue \"" queue "\"")))
+    (when (not= "failed" (:state task))
+      (raise! (str "Task \"" task-id "\" is not currently failed in queue \"" queue "\"")))
+    (if spawn-new?
+      (spawn-task conn now queue (:task-name task) (decode-json (:params task))
+                  (strip-nils {:headers (decode-json (:headers task))
+                               :retry_strategy (decode-json (:retry-strategy task))
+                               :max_attempts (or requested (:max-attempts task))
+                               :cancellation (decode-json (:cancellation task))}))
+      (let [attempts (:attempts task)
+            max-attempts (or requested (inc (or (:max-attempts task) attempts)))]
+        (when (<= max-attempts attempts)
+          (raise! (str "max_attempts (" max-attempts ") must be greater than current attempts ("
+                       attempts ")")))
+        (let [run-id (uuidv7 now)
+              attempt (inc attempts)]
+          (insert-run! conn now queue run-id task-id attempt "pending" now)
+          (update! conn ["update absurd_tasks
+                             set state = 'pending', attempts = max(attempts, ?), max_attempts = ?,
+                                 last_attempt_run = ?, cancelled_at = null
+                           where queue_name = ? and task_id = ?" attempt max-attempts run-id queue task-id])
+          {:task-id task-id
+           :run-id run-id
+           :attempt attempt
+           :created false})))))
