@@ -15,7 +15,8 @@
             [jsonista.core :as json]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs])
-  (:import [java.sql Connection Timestamp]
+  (:import [java.io File]
+           [java.sql Connection Timestamp]
            [java.time Instant OffsetDateTime]
            [java.time.format DateTimeFormatter]
            [java.util UUID]
@@ -65,6 +66,18 @@
   "A DataSource for the active backend's database."
   []
   (jdbc/get-datasource jdbc-url))
+
+(defn call-with-sqlite-db
+  "Call `(f datasource file)` on a fresh temp SQLite database file, then delete
+  the file with its `-wal` and `-shm` siblings."
+  [f]
+  (let [file (File/createTempFile "absurd-test" ".db")
+        path (.getAbsolutePath file)]
+    (try
+      (f (jdbc/get-datasource {:jdbcUrl (str "jdbc:sqlite:" path)}) file)
+      (finally
+        (doseq [suffix ["" "-wal" "-shm" "-journal"]]
+          (.delete (File. (str path suffix))))))))
 
 (defn- with-postgres
   "Open one connection, bind `*conn*`, reset fake time afterwards."
