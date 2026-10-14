@@ -703,6 +703,18 @@
             :last-attempt-run run-id}
            (select-keys (task-row task-id) [:state :cancelled-at :last-attempt-run])))))
 
+(deftest fail-run-accepts-a-max-duration-beyond-32-bits
+  (setup!)
+  (let [{:keys [task-id run-id]} (spawn! t0 {"retry_strategy" {"kind" "fixed"
+                                                               "base_seconds" 30}
+                                             "cancellation" {"max_duration" 9223372036854775807}})]
+    (claim! t0)
+    (tx #(engine/fail-run % (+ t0 1000) "q" run-id {:name "E"}))
+    (is (= "sleeping" (:state (task-row task-id))) "retried, not cancelled")
+    (is (= 2 (count (runs-of task-id))))
+    (testing "claiming with such a task does not abort"
+      (is (empty? (claim! (+ t0 1000)))))))
+
 (deftest fail-run-with-an-invalid-stored-strategy-fails-the-task-permanently
   (setup!)
   (let [{:keys [task-id run-id]} (spawn! t0)]

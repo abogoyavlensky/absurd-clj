@@ -278,17 +278,28 @@
     (catch IllegalArgumentException _
       (raise! "22P02" (str "invalid input syntax for type uuid: \"" id "\"")))))
 
-(defn- int-text
-  "Cast a JSON value to a 32-bit integer like `(v->>'k')::integer`: nil stays
-  nil, anything else that is not an integer raises."
-  [v]
+(defn- cast-integer
+  "Cast a JSON value to an integer of type `type-name` within [lo, hi], like
+  `(v->>'k')::<type>`: nil stays nil, anything else that is not an integer
+  raises."
+  [v type-name lo hi]
   (when-let [text (json-text v)]
     (if (re-matches #"\s*[-+]?\d+\s*" text)
       (let [n (BigInteger. (str/trim text))]
-        (if (<= Integer/MIN_VALUE n Integer/MAX_VALUE)
+        (if (<= lo n hi)
           (long n)
-          (raise! "22003" (str "value \"" (str/trim text) "\" is out of range for type integer"))))
-      (raise! "22P02" (str "invalid input syntax for type integer: \"" text "\"")))))
+          (raise! "22003" (str "value \"" (str/trim text) "\" is out of range for type " type-name))))
+      (raise! "22P02" (str "invalid input syntax for type " type-name ": \"" text "\"")))))
+
+(defn- int-text
+  "Cast to a 32-bit `integer`."
+  [v]
+  (cast-integer v "integer" Integer/MIN_VALUE Integer/MAX_VALUE))
+
+(defn- bigint-text
+  "Cast to a 64-bit `bigint`."
+  [v]
+  (cast-integer v "bigint" Long/MIN_VALUE Long/MAX_VALUE))
 
 (defn- validate-queue-name
   [queue]
@@ -599,10 +610,10 @@
                                                                         attempt)))
                                (catch SQLException e
                                  (if (= "AB003" (.getSQLState e)) nil (throw e)))))
-            max-duration (some-> (decode-json (:cancellation task)) :max_duration int-text)
+            max-duration (some-> (decode-json (:cancellation task)) :max_duration bigint-text)
             cancel? (boolean (and next-available max-duration (:first-started-at task)
                                   (>= (- next-available (:first-started-at task))
-                                      (* max-duration 1000))))
+                                      (*' max-duration 1000))))
             new-run-id (when (and next-available (not cancel?)) (uuidv7 now))
             state-after (cond cancel? "cancelled"
                               new-run-id (if (> next-available now) "sleeping" "pending")
