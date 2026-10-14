@@ -435,6 +435,10 @@
   (when (or (nil? task-name) (str/blank? task-name))
     (raise! "task_name must be provided"))
   (let [options (let [o (normalize options)] (if (map? o) o {}))
+        ;; An explicit JSON null is not an absent key: Postgres validates it
+        ;; and raises, so the two must stay distinct.
+        _ (when (and (contains? options :retry_strategy) (nil? (:retry_strategy options)))
+            (raise! "AB003" "retry_strategy must be a JSON object"))
         _ (retry-delay-seconds (:retry_strategy options) 1)
         max-attempts (when (contains? options :max_attempts)
                        (int-text (:max_attempts options)))

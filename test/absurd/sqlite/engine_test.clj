@@ -400,7 +400,8 @@
           [[nil nil "task_name must be provided"]
            ["  " nil "task_name must be provided"]
            ["t" {"max_attempts" 0} "max_attempts must be >= 1"]
-           ["t" {"retry_strategy" {:kind "linear"}} "Unsupported retry strategy kind \"linear\""]]]
+           ["t" {"retry_strategy" {:kind "linear"}} "Unsupported retry strategy kind \"linear\""]
+           ["t" {"retry_strategy" nil} "retry_strategy must be a JSON object"]]]
     (testing (pr-str [task-name options])
       (is (= message (ex-message (exception-of #(tx (fn [c] (engine/spawn-task c t0 "q" task-name nil options)))))))))
   (is (= "AB003" (.getSQLState ^SQLException (exception-of #(tx (fn [c] (engine/spawn-task c t0 "q" "t" nil {"retry_strategy" {:kind "linear"}})))))))
