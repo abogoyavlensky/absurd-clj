@@ -12,6 +12,8 @@
   (:import [java.io File]
            [java.sql Connection SQLException]
            [java.time Instant]
+           [java.util.concurrent ConcurrentHashMap]
+           [java.util.concurrent.atomic AtomicLong]
            [javax.sql DataSource]))
 
 (defn- url-of
@@ -222,3 +224,102 @@
         (testing "partitioned queues are rejected"
           (is (thrown-with-msg? SQLException #"Partitioned queues are not supported on SQLite"
                                 (absurd/create-queue! app "p" {:storage-mode :partitioned}))))))))
+
+;; Concurrency
+
+(defn- wait-until
+  "Poll `pred` for up to `seconds`; returns true when it became truthy."
+  [pred seconds]
+  (let [deadline (+ (System/nanoTime) (* seconds 1e9))]
+    (loop []
+      (cond
+        (pred) true
+        (> (System/nanoTime) deadline) false
+        :else (do (Thread/sleep 50) (recur))))))
+
+(defn- count-where
+  [ds sql]
+  (:n (jdbc/execute-one! ds [sql] {:builder-fn rs/as-unqualified-kebab-maps})))
+
+(defn- spawn-concurrently!
+  "Spawn `n` tasks named `task-name` from `threads` threads, each on its own
+  client over the same database (so they contend for SQLite's write lock the
+  way separate processes would). Returns the task ids."
+  [ds queue task-name n threads]
+  (let [producers (repeatedly threads #(absurd/client {:db ds
+                                                       :backend :sqlite
+                                                       :queue queue}))
+        futures (doall (map-indexed
+                         (fn [t producer]
+                           (future
+                             (mapv #(:task-id (absurd/spawn! producer task-name {:i %} {:queue queue}))
+                                   (range t n threads))))
+                         producers))]
+    (into [] (mapcat deref) futures)))
+
+(deftest concurrent-workers-complete-every-task-exactly-once
+  (h/call-with-sqlite-db
+    (fn [ds _file]
+      (let [app (absurd/client {:db ds
+                                :backend :sqlite
+                                :queue "stress"})
+            executions (AtomicLong. 0)
+            seen (ConcurrentHashMap/newKeySet)]
+        (absurd/create-queue! app)
+        (absurd/register-task! app "count" (fn [params ctx]
+                                             (.incrementAndGet executions)
+                                             (.add seen (:task-id ctx))
+                                             {:i (:i params)}))
+        (with-open [worker (absurd/start-worker! app {:worker-id "stress"
+                                                      :concurrency 4
+                                                      :claim-timeout 60
+                                                      :poll-interval 10})]
+          (let [task-ids (spawn-concurrently! ds "stress" "count" 200 4)]
+            (is (= 200 (count (set task-ids))))
+            (is (wait-until #(= 200 (count-where ds "select count(*) as n from absurd_tasks where state = 'completed'"))
+                            60))
+            (is (true? (absurd/stop-worker! worker)))
+            (is (= 200 (.get executions)) "every task body ran exactly once")
+            (is (= (set task-ids) (set seen)))
+            (is (zero? (count-where ds "select count(*) as n from absurd_tasks where state <> 'completed'")))
+            (is (= 200 (count-where ds "select count(*) as n from absurd_runs"))
+                "no task was claimed twice")
+            (is (zero? (count-where ds "select count(*) as n from absurd_runs where state <> 'completed'")))))))))
+
+(deftest steps-run-once-per-task-under-concurrency
+  (h/call-with-sqlite-db
+    (fn [ds _file]
+      (let [app (absurd/client {:db ds
+                                :backend :sqlite
+                                :queue "steps"})
+            a-runs (ConcurrentHashMap.)
+            b-runs (ConcurrentHashMap.)
+            bump! (fn [^ConcurrentHashMap m task-id]
+                    (.merge m task-id 1 (fn [x y] (+ (long x) (long y)))))]
+        (absurd/create-queue! app)
+        (absurd/register-task! app "two-steps"
+                               (fn [_params ctx]
+                                 (absurd/step ctx "a" (fn [] (bump! a-runs (:task-id ctx)) :a))
+                                 (absurd/step ctx "b" (fn [] (bump! b-runs (:task-id ctx)) :b))
+                                 ;; Outside both steps, after both checkpoints committed: attempt 2
+                                 ;; must replay them from the checkpoints instead of running them again.
+                                 (when (= 1 (:attempt ctx))
+                                   (throw (ex-info "retry me" {})))
+                                 {:attempt (:attempt ctx)}))
+        (with-open [worker (absurd/start-worker! app {:worker-id "steps"
+                                                      :concurrency 4
+                                                      :claim-timeout 60
+                                                      :poll-interval 10})]
+          (let [task-ids (spawn-concurrently! ds "steps" "two-steps" 200 4)]
+            (is (wait-until #(= 200 (count-where ds "select count(*) as n from absurd_tasks where state = 'completed'"))
+                            90))
+            (is (true? (absurd/stop-worker! worker)))
+            (is (= #{{:state :completed
+                      :result {:attempt 2}}}
+                   (set (map #(absurd/fetch-task-result app %) task-ids)))
+                "every task completed on attempt 2")
+            (is (= #{1} (set (vals a-runs))) "step a ran once per task")
+            (is (= #{1} (set (vals b-runs))) "step b ran once per task")
+            (is (= (set task-ids) (set (keys a-runs))))
+            (is (= 400 (count-where ds "select count(*) as n from absurd_runs")) "two attempts per task")
+            (is (= 400 (count-where ds "select count(*) as n from absurd_checkpoints")) "two checkpoints per task")))))))
