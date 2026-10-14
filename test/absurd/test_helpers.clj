@@ -46,11 +46,14 @@
 (def ^:private default-backends "postgres")
 
 (defn- test-backends
-  "The backends to run, from `ABSURD_TEST_BACKENDS`. Unknown names throw."
+  "The backends to run, from `ABSURD_TEST_BACKENDS`. Unknown names and an
+  empty selection throw, so the suite can never pass by running nothing."
   []
   (let [names (->> (str/split (or (System/getenv "ABSURD_TEST_BACKENDS") default-backends) #",")
                    (map str/trim)
                    (remove str/blank?))]
+    (when (empty? names)
+      (throw (ex-info "ABSURD_TEST_BACKENDS selects no backend" {})))
     (mapv (fn [n]
             (let [backend (keyword n)]
               (when-not (contains? #{:postgres} backend)
