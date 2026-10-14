@@ -5,7 +5,7 @@
   A client is an open map built by `client`. Handlers are plain functions
   `(fn [params ctx] ...)`. Every context operation takes the context first."
   (:require [absurd.json :as json]
-            [absurd.sql :as sql]
+            [absurd.store :as store]
             [clojure.stacktrace :as stacktrace]
             [clojure.string :as str]
             [clojure.tools.logging :as log]
@@ -132,14 +132,16 @@
           hooks {}
           now-fn #(Instant/now)}}]
    (validate-queue-name queue)
-   {:db (->connectable db)
-    :owned-db? (or (nil? db) (string? db))
-    :queue queue
-    :max-attempts max-attempts
-    :hooks hooks
-    :now-fn now-fn
-    :registry (atom {})
-    :worker (atom nil)}))
+   (let [connectable (->connectable db)]
+     {:db connectable
+      :store (store/postgres-store connectable)
+      :owned-db? (or (nil? db) (string? db))
+      :queue queue
+      :max-attempts max-attempts
+      :hooks hooks
+      :now-fn now-fn
+      :registry (atom {})
+      :worker (atom nil)})))
 
 (declare stop-worker!)
 
@@ -244,7 +246,7 @@
    (let [hook (get-in app [:hooks :before-spawn])
          opts (if hook (hook task-name params opts) opts)
          [queue options] (prepare-spawn app task-name opts)]
-     (sql/spawn-task! (:db app) queue task-name params options))))
+     (store/spawn-task! (:store app) queue task-name params options))))
 
 ;; Task results
 
@@ -298,7 +300,7 @@
   `:failure` when failed. nil when the task does not exist."
   ([app task-id] (fetch-task-result app task-id {}))
   ([app task-id {:keys [queue]}]
-   (some-> (sql/get-task-result (:db app) (queue-of app queue) task-id)
+   (some-> (store/get-task-result (:store app) (queue-of app queue) task-id)
            ->snapshot)))
 
 (declare context-await-task-result)
@@ -326,13 +328,13 @@
   ([x event-name payload {:keys [queue]}]
    (validate-event-name event-name)
    (if (client? x)
-     (sql/emit-event! (:db x) (queue-of x queue) event-name payload)
+     (store/emit-event! (:store x) (queue-of x queue) event-name payload)
      (context-emit-event! x event-name payload))))
 
 (defn cancel-task!
   ([app task-id] (cancel-task! app task-id {}))
   ([app task-id {:keys [queue]}]
-   (sql/cancel-task! (:db app) (queue-of app queue) task-id)))
+   (store/cancel-task! (:store app) (queue-of app queue) task-id)))
 
 (defn retry-task!
   "Retry a failed task in place, or spawn a fresh task from the same inputs
@@ -341,7 +343,7 @@
   ([app task-id] (retry-task! app task-id {}))
   ([app task-id {:keys [queue]
                  :as opts}]
-   (sql/retry-task! (:db app) (queue-of app queue) task-id (retry-options->json opts))))
+   (store/retry-task! (:store app) (queue-of app queue) task-id (retry-options->json opts))))
 
 ;; Queue management
 
@@ -352,7 +354,7 @@
   [app queue opts]
   (let [policy (queue-policy->json opts)]
     (when (seq policy)
-      (sql/set-queue-policy! (:db app) (queue-of app queue) policy))
+      (store/set-queue-policy! (:store app) (queue-of app queue) policy))
     nil))
 
 (defn create-queue!
@@ -367,26 +369,26 @@
      (when-not (contains? #{"unpartitioned" "partitioned"} mode)
        (fail "storage-mode must be :unpartitioned or :partitioned"
              :absurd/invalid-storage-mode {:storage-mode storage-mode}))
-     (sql/create-queue! (:db app) queue (when (= mode "partitioned") mode))
+     (store/create-queue! (:store app) queue (when (= mode "partitioned") mode))
      (set-queue-policy! app queue opts))))
 
 (defn get-queue-policy
   "The queue's maintenance policy with interval fields as strings, or nil."
   ([app] (get-queue-policy app nil))
   ([app queue]
-   (some-> (sql/get-queue-policy (:db app) (queue-of app queue))
+   (some-> (store/get-queue-policy (:store app) (queue-of app queue))
            (update :storage-mode keyword)
            (update :detach-mode keyword))))
 
 (defn drop-queue!
   ([app] (drop-queue! app nil))
   ([app queue]
-   (sql/drop-queue! (:db app) (queue-of app queue))))
+   (store/drop-queue! (:store app) (queue-of app queue))))
 
 (defn list-queues
   "All queue names."
   [app]
-  (sql/list-queues (:db app)))
+  (store/list-queues (:store app)))
 
 ;; Claiming
 
@@ -398,7 +400,7 @@
          :or {batch-size 1
               claim-timeout 120
               worker-id "worker"}}]
-   (sql/claim-tasks! (:db app) (:queue app) worker-id claim-timeout batch-size)))
+   (store/claim-tasks! (:store app) (:queue app) worker-id claim-timeout batch-size)))
 
 ;; Task context
 
@@ -413,9 +415,9 @@
 
 (def ^:private not-found ::not-found)
 
-(defn- ctx-db
+(defn- ctx-store
   [ctx]
-  (:db (::client ctx)))
+  (:store (::client ctx)))
 
 (defn- decode-headers
   [headers]
@@ -434,7 +436,7 @@
         headers (decode-headers (:headers claim))
         checkpoints (into {}
                           (map (juxt :checkpoint-name :state))
-                          (sql/get-task-checkpoint-states (:db app) queue (:task-id claim) (:run-id claim)))]
+                          (store/get-task-checkpoint-states (:store app) queue (:task-id claim) (:run-id claim)))]
     {:task-id (:task-id claim)
      :run-id (:run-id claim)
      :task-name (:task-name claim)
@@ -461,15 +463,15 @@
   (let [cache @(::checkpoints ctx)]
     (if (contains? cache checkpoint-name)
       (get cache checkpoint-name)
-      (if-let [row (sql/get-task-checkpoint-state (ctx-db ctx) (:queue ctx) (:task-id ctx) checkpoint-name)]
+      (if-let [row (store/get-task-checkpoint-state (ctx-store ctx) (:queue ctx) (:task-id ctx) checkpoint-name)]
         (do (swap! (::checkpoints ctx) assoc checkpoint-name (:state row))
             (:state row))
         not-found))))
 
 (defn- persist-checkpoint!
   [ctx checkpoint-name value]
-  (sql/set-task-checkpoint-state! (ctx-db ctx) (:queue ctx) (:task-id ctx) checkpoint-name
-                                  value (:run-id ctx) (::claim-timeout ctx))
+  (store/set-task-checkpoint-state! (ctx-store ctx) (:queue ctx) (:task-id ctx) checkpoint-name
+                                    value (:run-id ctx) (::claim-timeout ctx))
   (swap! (::checkpoints ctx) assoc checkpoint-name value)
   (lease-touch! ctx (::claim-timeout ctx))
   nil)
@@ -512,13 +514,13 @@
   "Extend the current run's lease by `seconds` (default: the claim timeout)."
   ([ctx] (heartbeat! ctx (::claim-timeout ctx)))
   ([ctx seconds]
-   (sql/extend-claim! (ctx-db ctx) (:queue ctx) (:run-id ctx) seconds)
+   (store/extend-claim! (ctx-store ctx) (:queue ctx) (:run-id ctx) seconds)
    (lease-touch! ctx seconds)
    nil))
 
 (defn- context-emit-event!
   [ctx event-name payload]
-  (sql/emit-event! (ctx-db ctx) (:queue ctx) event-name payload))
+  (store/emit-event! (ctx-store ctx) (:queue ctx) event-name payload))
 
 ;; Sleeping
 
@@ -561,7 +563,7 @@
                          :else wake-at)
         remaining-seconds (/ (- (.toEpochMilli actual-wake-at) (.toEpochMilli (now ctx))) 1000.0)]
     (when (pos? remaining-seconds)
-      (sql/schedule-run-after! (ctx-db ctx) (:queue ctx) (:run-id ctx) remaining-seconds)
+      (store/schedule-run-after! (ctx-store ctx) (:queue ctx) (:run-id ctx) remaining-seconds)
       (suspend!))
     nil))
 
@@ -590,8 +592,8 @@
                (fail (str "Timed out waiting for event \"" event-name "\"")
                      :absurd/timeout {:event-name event-name}))
            (let [{:keys [should-suspend payload]}
-                 (sql/await-event (ctx-db ctx) (:queue ctx) (:task-id ctx) (:run-id ctx)
-                                  checkpoint-name event-name (some-> timeout (max 0)))]
+                 (store/await-event (ctx-store ctx) (:queue ctx) (:task-id ctx) (:run-id ctx)
+                                    checkpoint-name event-name (some-> timeout (max 0)))]
              (when should-suspend
                (suspend!))
              (swap! (::checkpoints ctx) assoc checkpoint-name payload)
@@ -743,7 +745,7 @@
   "Record a failure for the run, ignoring cancelled/already-failed signals."
   [app run-id ^Throwable t]
   (try
-    (sql/fail-run! (:db app) (:queue app) run-id (failure-payload t))
+    (store/fail-run! (:store app) (:queue app) run-id (failure-payload t))
     (catch clojure.lang.ExceptionInfo e
       (when-not (terminal-signal? e)
         (throw e)))))
@@ -753,7 +755,7 @@
   (let [run-id (:run-id claim)]
     (try
       (let [defer-seconds (unknown-task-defer-seconds run-id)]
-        (sql/schedule-run-after! (:db app) (:queue app) run-id defer-seconds)
+        (store/schedule-run-after! (:store app) (:queue app) run-id defer-seconds)
         (log/warnf "claimed unknown task %s (%s); deferred run %s by %ds"
                    (:task-name claim) (:task-id claim) run-id defer-seconds))
       (catch Throwable t
@@ -791,7 +793,7 @@
       :else
       (try
         (let [result (run-handler! app registration claim claim-timeout lease)]
-          (sql/complete-run! (:db app) (:queue app) run-id (json/round-trip result)))
+          (store/complete-run! (:store app) (:queue app) run-id (json/round-trip result)))
         (catch Throwable t
           (case (signal-type t)
             (:absurd/suspend :absurd/cancelled :absurd/failed-run) nil
