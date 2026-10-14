@@ -162,7 +162,10 @@
     (is (= 0.0 (engine/retry-delay-seconds {:kind "exponential"
                                             :factor 0.5} 5000))))
   (testing "a missing attempt counts as the first one"
-    (is (= 30.0 (engine/retry-delay-seconds {:kind "exponential"} nil)))))
+    (is (= 30.0 (engine/retry-delay-seconds {:kind "exponential"} nil))))
+  (testing "zero is valid even when written with an exponent"
+    (is (= 0.0 (engine/retry-delay-seconds {:kind "fixed"
+                                            :base_seconds "0e-999"} 1)))))
 
 (deftest retry-delay-seconds-rejects-invalid-input
   (doseq [[strategy message] [["not-an-object" "retry_strategy must be a JSON object"]
@@ -179,7 +182,11 @@
                               [{:kind "exponential"
                                 :max_seconds 86401} "retry_strategy.max_seconds must be between 0 and 86400"]
                               [{:kind "fixed"
-                                :base_seconds "abc"} "retry_strategy contains an invalid number"]]]
+                                :base_seconds "abc"} "retry_strategy contains an invalid number"]
+                              [{:kind "fixed"
+                                :base_seconds "1e-999"} "retry_strategy contains an invalid number"]
+                              [{:kind "fixed"
+                                :base_seconds "1e999"} "retry_strategy contains an invalid number"]]]
     (testing (pr-str strategy)
       (let [e (try (engine/retry-delay-seconds strategy 1)
                    nil

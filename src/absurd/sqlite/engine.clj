@@ -14,6 +14,7 @@
   `java.sql.SQLException` whose message is the Postgres text and whose SQLState
   is AB001, AB002, AB003 or P0001."
   (:require [absurd.json :as json]
+            [clojure.string :as str]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs])
   (:import [java.security SecureRandom]
@@ -108,8 +109,10 @@
       (Double/parseDouble (-> t (.replaceAll "(?i)infinity|inf" "Infinity") (.replaceAll "(?i)nan" "NaN")))
 
       (re-matches #"[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?" t)
-      (let [d (Double/parseDouble t)]
-        (if (Double/isInfinite d)
+      (let [d (Double/parseDouble t)
+            nonzero-mantissa? (boolean (re-find #"[1-9]" (first (str/split t #"[eE]"))))]
+        ;; Postgres rejects overflow and underflow to zero as out of range.
+        (if (or (Double/isInfinite d) (and (zero? d) nonzero-mantissa?))
           (raise! "AB003" "retry_strategy contains an invalid number")
           d))
 
