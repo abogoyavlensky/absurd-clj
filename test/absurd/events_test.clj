@@ -1,9 +1,7 @@
 (ns absurd.events-test
   (:require [absurd.core :as absurd]
             [absurd.test-helpers :as h]
-            [clojure.test :refer [deftest is testing use-fixtures]]
-            [next.jdbc :as jdbc]
-            [next.jdbc.result-set :as rs])
+            [clojure.test :refer [deftest is testing use-fixtures]])
   (:import [java.time Instant]))
 
 (use-fixtures :each h/with-conn)
@@ -14,12 +12,8 @@
                                              :claim-timeout 120
                                              :batch-size batch-size})))
 
-(defn- count-waits [queue]
-  (:n (jdbc/execute-one! h/*conn* [(str "select count(*) as n from absurd.w_" queue)]
-                         {:builder-fn rs/as-unqualified-kebab-maps})))
-
 (defn- available-at ^Instant [run]
-  (.toInstant ^java.sql.Timestamp (:available-at run)))
+  (:available-at run))
 
 (deftest await-and-emit-event-flow
   (let [app (h/test-client)
@@ -58,12 +52,9 @@
     (absurd/emit-event! app event-name {:value 1})
     (h/set-fake-now! h/*conn* (.plusSeconds first-emit 30))
     (absurd/emit-event! app event-name {:value 2})
-    (let [row (jdbc/execute-one! h/*conn*
-                                 [(str "select payload, emitted_at from absurd.e_" (:queue app)
-                                       " where event_name = ?") event-name]
-                                 {:builder-fn rs/as-unqualified-kebab-maps})]
-      (is (= "{\"value\": 1}" (.getValue ^org.postgresql.util.PGobject (:payload row))))
-      (is (= first-emit (.toInstant ^java.sql.Timestamp (:emitted-at row)))))
+    (let [row (h/get-event h/*conn* (:queue app) event-name)]
+      (is (= {:value 1} (:payload row)))
+      (is (= first-emit (:emitted-at row))))
     (absurd/register-task! app "late-waiter" (fn [_ ctx] {:received (absurd/await-event ctx event-name)}))
     (let [spawned (absurd/spawn! app "late-waiter" nil)]
       (work! app)
@@ -87,7 +78,7 @@
                                          (throw e))))))
         spawned (absurd/spawn! app "timeout-waiter" nil)]
     (work! app)
-    (is (= 1 (count-waits (:queue app))))
+    (is (= 1 (h/count-waits h/*conn* (:queue app))))
     (let [run (h/get-run h/*conn* (:queue app) (:run-id spawned))]
       (is (= "sleeping" (:state run)))
       (is (= event-name (:wake-event run)))
@@ -98,7 +89,7 @@
       (is (= "completed" (:state task)))
       (is (= {:timedOut true
               :result nil} (:completed-payload task))))
-    (is (= 0 (count-waits (:queue app))))))
+    (is (= 0 (h/count-waits h/*conn* (:queue app))))))
 
 (deftest multiple-tasks-can-await-same-event
   (let [app (h/test-client)
@@ -138,10 +129,10 @@
                                          (throw e))))))
         spawned (absurd/spawn! app "timeout-no-loop" nil)]
     (work! app)
-    (is (= 1 (count-waits (:queue app))))
+    (is (= 1 (h/count-waits h/*conn* (:queue app))))
     (h/set-fake-now! h/*conn* (.plusSeconds base 15))
     (work! app)
-    (is (= 0 (count-waits (:queue app))))
+    (is (= 0 (h/count-waits h/*conn* (:queue app))))
     (is (= "completed" (:state (h/get-run h/*conn* (:queue app) (:run-id spawned)))))
     (let [task (h/get-task h/*conn* (:queue app) (:task-id spawned))]
       (is (= "completed" (:state task)))
@@ -169,10 +160,7 @@
                    (h/get-checkpoints h/*conn* (:queue app) (:task-id replay))))))
     (testing "the context can emit events on its own queue"
       (absurd/emit-event! ctx "from-ctx" {:n 1})
-      (is (= 1 (:n (jdbc/execute-one! h/*conn*
-                                      [(str "select count(*) as n from absurd.e_" (:queue app)
-                                            " where event_name = 'from-ctx'")]
-                                      {:builder-fn rs/as-unqualified-kebab-maps})))))))
+      (is (= {:n 1} (:payload (h/get-event h/*conn* (:queue app) "from-ctx")))))))
 
 (deftest await-event-negative-timeout-does-not-sleep-forever
   (let [app (-> (h/test-client)

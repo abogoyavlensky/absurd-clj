@@ -1,6 +1,6 @@
 (ns absurd.heartbeat-test
   (:require [absurd.core :as absurd]
-            [absurd.sql :as sql]
+            [absurd.store :as store]
             [absurd.test-helpers :as h]
             [clojure.string :as str]
             [clojure.test :refer [deftest is use-fixtures]])
@@ -12,8 +12,8 @@
 (def ^:private execute-task! (ns-resolve 'absurd.core 'execute-task!))
 
 (defn- fail-run-directly! [app run-id]
-  (sql/fail-run! h/*conn* (:queue app) run-id {:name "$ClaimTimeout"
-                                               :message "timeout"}))
+  (store/fail-run! (h/store) (:queue app) run-id {:name "$ClaimTimeout"
+                                                  :message "timeout"}))
 
 (deftest heartbeat-zero-is-rejected-by-sql
   (let [app (-> (h/test-client)
@@ -45,7 +45,7 @@
         ctx (make-context app claim 600 nil)
         before (Instant/now)]
     (absurd/heartbeat! ctx)
-    (let [expires (.toInstant ^java.sql.Timestamp (:claim-expires-at (h/get-run h/*conn* (:queue app) (:run-id claim))))]
+    (let [expires (:claim-expires-at (h/get-run h/*conn* (:queue app) (:run-id claim)))]
       (is (.isAfter expires (.plusSeconds before 590))))))
 
 (deftest execute-task-swallows-failed-run-on-checkpoint

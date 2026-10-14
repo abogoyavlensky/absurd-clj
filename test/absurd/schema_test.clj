@@ -6,5 +6,6 @@
 (use-fixtures :each h/with-conn)
 
 (deftest vendored-schema-version-matches-target
-  (is (= "0.5.0"
-         (:v (jdbc/execute-one! h/*conn* ["select absurd.get_schema_version() as v"])))))
+  (h/only :postgres
+          (is (= "0.5.0"
+                 (:v (jdbc/execute-one! h/*conn* ["select absurd.get_schema_version() as v"]))))))
