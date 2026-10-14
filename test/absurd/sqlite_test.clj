@@ -67,6 +67,37 @@
             (is (= 20 (count (set (map :task-id spawned))))))
           (is (false? (.isClosed conn)) "the client never closes a connection it was given"))))))
 
+(deftest in-memory-urls-are-rejected-but-a-memory-connection-works
+  (doseq [url ["jdbc:sqlite::memory:" "jdbc:sqlite:" "jdbc:sqlite:file::memory:?cache=private"
+               "jdbc:sqlite:file:x?mode=memory"]]
+    (testing url
+      (is (= :absurd/invalid-db (h/ex-type #(absurd/client {:db url}))))))
+  (testing "a file URL with a query string is still accepted"
+    (is (= :sqlite (:backend (absurd/client {:db "jdbc:sqlite:/tmp/absurd-x.db?busy_timeout=5000"})))))
+  (testing "one shared Connection to a memory database is the supported way"
+    (with-open [^Connection conn (jdbc/get-connection "jdbc:sqlite::memory:")]
+      (is (= {:state :completed
+              :result {:echo {:value 1}}}
+             (run-one-task! (absurd/client {:db conn
+                                            :backend :sqlite})))))))
+
+(deftest the-engine-clock-is-read-inside-the-transaction
+  (h/call-with-sqlite-db
+    (fn [ds _file]
+      (let [holder (atom nil)
+            held? (atom [])
+            st (sqlite/store ds {:db-now-fn (fn []
+                                              (swap! held? conj (.isHeldByCurrentThread
+                                                                  ^java.util.concurrent.locks.ReentrantLock
+                                                                  (:lock @holder)))
+                                              (Instant/now))})]
+        (reset! holder st)
+        (store/create-queue! st "q" nil)
+        (store/list-queues st)
+        (store/current-time st)
+        (is (= [true true false] @held?)
+            "operations read the clock under the lock; current-time is not an operation")))))
+
 (deftest the-engine-clock-is-pluggable
   (h/call-with-sqlite-db
     (fn [ds _file]

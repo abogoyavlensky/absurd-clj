@@ -83,6 +83,17 @@
   [db]
   (and (string? db) (str/starts-with? db sqlite-url-prefix)))
 
+(defn- sqlite-memory-url?
+  "True for a SQLite URL whose database lives in a single connection: a new
+  connection would see an empty database."
+  [^String url]
+  (let [target (subs url (count sqlite-url-prefix))
+        path (first (str/split target #"\?" 2))]
+    (boolean (or (str/blank? path)
+                 (str/starts-with? path ":memory:")
+                 (str/starts-with? path "file::memory:")
+                 (str/includes? target "mode=memory")))))
+
 (defn- resolve-backend
   "The backend to use: `backend` when given, else `:sqlite` for a
   `jdbc:sqlite:` URL and `:postgres` for everything else."
@@ -105,6 +116,10 @@
       (cond
         (nil? db) (fail "A SQLite client needs :db; there is no environment fallback"
                         :absurd/invalid-db {:db db})
+        (and (sqlite-url? db) (sqlite-memory-url? db))
+        (fail (str "An in-memory SQLite database lives in one connection, so a URL cannot "
+                   "share it: open a Connection and pass it as :db with :backend :sqlite")
+              :absurd/invalid-db {:db db})
         (sqlite-url? db) (jdbc/get-datasource {:jdbcUrl db})
         :else (invalid-db))
 

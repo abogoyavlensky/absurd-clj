@@ -41,12 +41,13 @@
 
 (defn- run
   "Run `(f conn now)` in a transaction of `mode`, with AB001 and AB002 mapped
-  to the SDK's signals. `now` is the engine clock, read once per operation."
+  to the SDK's signals. `now` is the engine clock, read once per operation
+  after the store lock, the connection and SQLite's write lock are held, so a
+  queued operation never works with a stale timestamp."
   [this mode f]
   (ensure-ready! this)
-  (let [now (now-ms (:now-fn this))]
-    (sql/with-task-state-errors
-      (engine/run-tx this mode #(f % now)))))
+  (sql/with-task-state-errors
+    (engine/run-tx this mode #(f % (now-ms (:now-fn this))))))
 
 (defrecord SqliteStore [connectable lock now-fn schema]
   store/Store
