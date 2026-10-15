@@ -3,7 +3,9 @@
 [![CI](https://github.com/abogoyavlensky/absurd-clj/actions/workflows/checks.yaml/badge.svg?branch=main)](https://github.com/abogoyavlensky/absurd-clj/actions/workflows/checks.yaml)
 
 Clojure SDK for [Absurd](https://github.com/earendil-works/absurd), a durable
-execution workflow system built entirely on Postgres.
+execution workflow system built entirely on Postgres. It can also run on
+SQLite, for single-process apps that want durable execution with one database
+file and no database server (see [SQLite backend](#sqlite-backend)).
 
 Absurd keeps all the durable-execution logic in Postgres stored procedures.
 This library is the thin Clojure layer on top: it registers task handlers,
@@ -60,17 +62,79 @@ A client is a plain map. Options:
 
 | Key             | Default                | Meaning                                                   |
 |-----------------|------------------------|-----------------------------------------------------------|
-| `:db`           | env-resolved URL       | `DataSource`, `java.sql.Connection`, URL string, or nil   |
+| `:db`           | env-resolved URL       | `DataSource`, `java.sql.Connection`, URL string, or nil (nil needs Postgres) |
+| `:backend`      | inferred               | `:postgres` or `:sqlite`; a `jdbc:sqlite:` URL infers `:sqlite`, anything else `:postgres` |
 | `:queue`        | `"default"`            | Default queue for spawning and workers                    |
 | `:max-attempts` | `5`                    | Default retry limit                                       |
 | `:hooks`        | `{}`                   | `:before-spawn`, `:wrap-task-execution`, `:on-lease-timeout` |
 | `:now-fn`       | `Instant/now`          | Clock used to compute sleep wake times                    |
+| `:db-now-fn`    | `Instant/now`          | SQLite only: the engine clock, standing in for Postgres `absurd.current_time()` |
 
 URLs in `postgresql://` or `postgres://` form are converted to JDBC URLs;
 credentials in the URL become `user` and `password` parameters. A `jdbc:`
 URL is used as is.
 
 `(absurd/close! app)` stops a running worker.
+
+## SQLite backend
+
+The same API runs on SQLite. Absurd's engine lives in Postgres stored
+procedures; for SQLite this library ports them to Clojure (`absurd.sqlite.engine`)
+behind the `absurd.store/Store` protocol, and the Postgres test suite runs
+against both backends.
+
+Add the driver yourself, the same way you add a connection pool. The library
+has no compile-time dependency on it, so Postgres users never download it:
+
+```clojure
+{:deps {org.xerial/sqlite-jdbc {:mvn/version "3.53.4.0"}}}
+```
+
+```clojure
+;; From a URL: a "jdbc:sqlite:" URL infers the backend
+(def app (absurd/client {:db "jdbc:sqlite:app.db" :queue "default"}))
+
+;; From a DataSource or Connection: say which backend it is
+(def app (absurd/client {:db datasource :backend :sqlite}))
+```
+
+The schema (`absurd_*` tables, so they can live in your application's own
+database file) is created on the first operation, and the database is switched
+to WAL journaling. The client still never connects in its constructor. To create
+the schema at boot instead, call `ensure-schema!`:
+
+```clojure
+(require '[absurd.sqlite :as sqlite])
+(sqlite/ensure-schema! datasource)
+```
+
+Each operation is one SQLite transaction (`BEGIN IMMEDIATE` for writes). Every
+operation over the same `DataSource` or `Connection` object takes one
+in-process lock, so workers, request threads and several clients (say, one per
+queue) can share a single `Connection` safely. Run **one process writing to the
+database file**, with any number of threads. Several processes work too but
+contend for SQLite's write lock (waiting up to the driver's `busy_timeout`,
+3 s by default); that setup is not tested.
+
+Where it differs from Postgres:
+
+- **No partitioned queues.** `create-queue!` with `:storage-mode :partitioned`
+  throws.
+- **Policy intervals are stored verbatim.** `set-queue-policy!` accepts
+  `<n> second|minute|hour|day|week[s]` and keeps the text as given, where
+  Postgres normalizes `"12345 seconds"` to `"03:25:45"`. Anything else,
+  including negative values, throws.
+- **No cleanup yet.** `cleanup_ttl` and `cleanup_limit` are stored but never
+  enforced, so finished tasks stay in the file. See
+  [docs/backlog/sqlite-cleanup.md](docs/backlog/sqlite-cleanup.md).
+- **Not shared with other-language SDKs.** The Python and Go SDKs only speak to
+  the Postgres procedures, so workers in other languages cannot use a SQLite
+  queue.
+- **The engine clock is the JVM clock** (`:db-now-fn`, default `Instant/now`),
+  not the database's. All timestamps come from the one process that writes.
+- **No in-memory URLs.** Every new connection to `jdbc:sqlite::memory:` is a
+  fresh empty database, so such a URL is rejected. Open a `Connection` and pass it
+  as `:db` with `:backend :sqlite` instead.
 
 ## Registering tasks
 
@@ -244,6 +308,9 @@ All SDK errors are `ex-info` with a `:type` key:
 | `:absurd/timeout`               | `await-event` or `await-task-result` timed out       |
 | `:absurd/task-not-found`        | Task result lookup found nothing                     |
 | `:absurd/invalid-queue-name`    | Empty or longer than 57 bytes                        |
+| `:absurd/invalid-db`            | Unsupported `:db` value, or SQLite without `:db` or with an in-memory URL |
+| `:absurd/invalid-backend`       | `:backend` is neither `:postgres` nor `:sqlite`      |
+| `:absurd/schema-version-mismatch` | A SQLite file written by another schema version    |
 | `:absurd/queue-mismatch`        | Spawn asked for a queue other than the registered one |
 | `:absurd/unregistered-task`     | Spawn of an unknown task without `:queue`            |
 | `:absurd/same-queue-wait`       | Context wait on a task in the same queue             |
@@ -267,7 +334,10 @@ mise install
 ```
 
 Docker is required for the tests: they start Postgres through Testcontainers
-and load the vendored schema from `test/resources/absurd.sql`.
+and load the vendored schema from `test/resources/absurd.sql`. Every test runs
+once per backend listed in `ABSURD_TEST_BACKENDS` (comma-separated, default
+`postgres,sqlite`); `ABSURD_TEST_BACKENDS=sqlite bb test` runs the suite on
+SQLite alone, without Docker.
 
 ```shell
 bb tasks            # list all tasks

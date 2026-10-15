@@ -13,10 +13,9 @@
   ([] (pooled-client {}))
   ([opts]
    (let [queue (h/random-queue "worker")]
-     (absurd/create-queue! (absurd/client {:db h/*conn*
-                                           :queue queue}))
-     (absurd/client (merge {:db (h/datasource)
-                            :queue queue} opts)))))
+     (absurd/create-queue! (absurd/client (merge (h/client-opts) {:queue queue})))
+     (absurd/client (merge (h/client-opts) {:db (h/datasource)
+                                            :queue queue} opts)))))
 
 (defn- await-latch [^CountDownLatch latch seconds]
   (.await latch (long seconds) TimeUnit/SECONDS))

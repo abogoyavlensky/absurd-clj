@@ -6,6 +6,30 @@ tests have no equivalent because this SDK has no async client, and the
 `run_step` decorator tests are skipped because the decorator form is not part
 of the Clojure API.
 
+## Backends
+
+The suite runs on both backends. `absurd.test-helpers/with-conn` runs every test
+once per backend in `ABSURD_TEST_BACKENDS` (default `postgres,sqlite`), and the
+row helpers (`get-task`, `get-run`, `get-checkpoints`, ...) return the same shapes
+on both. Nothing was loosened to make SQLite pass. Tests that only make sense on
+one backend are guarded with `h/only`:
+
+- Postgres only: `absurd.schema-test/vendored-schema-version-matches-target`,
+  the Postgres URL tests in `absurd.client-test` (`resolve-database-url-follows-upstream-order`,
+  `jdbc-url-conversion`, `constructor-fails-before-connect-on-empty-queue`,
+  `client-from-url-opens-its-own-datasource`) and
+  `absurd.client-test/partitioned-queue-policy-normalizes-intervals`. The
+  cross-SDK check (`bb cross-sdk-test`) also needs Postgres.
+- SQLite counterparts for the documented divergences:
+  `absurd.client-test/sqlite-queue-policy-stores-intervals-verbatim`,
+  `partitioned-queues-are-rejected-on-sqlite`,
+  `sqlite-client-keeps-the-database-it-was-given`, and
+  `absurd.schema-test/sqlite-schema-version-is-recorded`.
+- SQLite engine and deployment tests: `absurd.sqlite.engine-test/*` (each ported
+  procedure against Postgres semantics), and `absurd.sqlite-test/*` (client wiring,
+  lazy schema, single connection, in-memory URLs and the concurrency tests with 4
+  worker threads and 200 tasks).
+
 ## test_absurd.py
 
 | Python | Clojure |
@@ -157,5 +181,5 @@ of the Clojure API.
 - `absurd.worker-test/lease-watchdog-warns-and-calls-the-hook`, `heartbeat-reschedules-the-watchdog`, `stop-worker-returns-false-when-shutdown-times-out`, `only-one-worker-per-client`, `stop-worker-returns-promptly-from-a-long-poll-sleep`, `worker-handle-is-closeable-and-registered-on-the-client`
 - `absurd.client-test/jdbc-url-conversion`, `client-is-an-open-map`, `client-from-url-opens-its-own-datasource`
 - `absurd.spawn-test/header-keys-are-stored-as-written`, `max-attempts-precedence`, `registered-task-rejects-mismatched-queue`, `emit-event-validates-name`
-- `absurd.sql-test/*` and `absurd.json-test/*`: unit coverage of the lower layers.
+- `absurd.store-test/*` and `absurd.json-test/*`: unit coverage of the lower layers (the store tests run on both backends).
 - The cross-SDK check (`bb cross-sdk-test`) runs tasks across this SDK and the Python SDK in both directions.

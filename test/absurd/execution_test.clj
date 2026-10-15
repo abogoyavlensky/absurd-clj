@@ -2,8 +2,7 @@
   (:require [absurd.core :as absurd]
             [absurd.test-helpers :as h]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is use-fixtures]]
-            [next.jdbc :as jdbc])
+            [clojure.test :refer [deftest is use-fixtures]])
   (:import [java.time Instant]))
 
 (use-fixtures :each h/with-conn)
@@ -41,7 +40,7 @@
       (work! app "unknown-worker")
       (let [task (h/get-task h/*conn* (:queue app) (:task-id spawned))
             run (h/get-run h/*conn* (:queue app) (:run-id spawned))
-            available-at (.toInstant ^java.sql.Timestamp (:available-at run))]
+            available-at (:available-at run)]
         (is (= "sleeping" (:state task)))
         (is (= 1 (:attempts task)))
         (is (= "sleeping" (:state run)))
@@ -69,8 +68,7 @@
         _ (absurd/register-task! worker "misqueued-task" (fn [_ _] {:ok true})
                                  {:queue other-queue
                                   :max-attempts 1})
-        producer (absurd/client {:db h/*conn*
-                                 :queue (:queue worker)})
+        producer (absurd/client (merge (h/client-opts) {:queue (:queue worker)}))
         spawned (absurd/spawn! producer "misqueued-task" nil {:queue (:queue worker)
                                                               :max-attempts 1})]
     (work! worker)
@@ -115,9 +113,7 @@
                 (absurd/register-task! "headered" (fn [_ ctx] {:headers (:headers ctx)})
                                        {:max-attempts 1}))
         spawned (absurd/spawn! app "headered" nil)]
-    (jdbc/execute! h/*conn* [(str "update absurd.t_" (:queue app)
-                                  " set headers = '\"not-an-object\"'::jsonb where task_id = ?::uuid")
-                             (:task-id spawned)])
+    (h/set-task-headers-json! h/*conn* (:queue app) (:task-id spawned) "\"not-an-object\"")
     (work! app)
     (is (= "failed" (:state (h/get-task h/*conn* (:queue app) (:task-id spawned)))))
     (is (str/includes? (:message (h/get-failure h/*conn* (:queue app) (:run-id spawned)))
@@ -266,3 +262,18 @@
       (is (= "failed" (:state (h/get-task h/*conn* (:queue app) (:task-id spawned)))))
       (is (= "pending" (:state (h/get-task h/*conn* (:queue app) (:task-id retry)))))
       (is (= 0 (h/count-checkpoints h/*conn* (:queue app) (:task-id retry)))))))
+
+(deftest keys-with-a-slash-survive-spawn-and-retry-spawn-new
+  (let [app (-> (h/test-client)
+                (absurd/register-task! "slash-keys" (fn [_ _] (throw (ex-info "boom" {})))
+                                       {:max-attempts 1}))
+        spawned (absurd/spawn! app "slash-keys" {"a/b" 1} {:headers {"x/trace" "abc"}})
+        stored (fn [task-id] (select-keys (h/get-task h/*conn* (:queue app) task-id) [:params :headers]))]
+    (is (= {:params {:a/b 1}
+            :headers {:x/trace "abc"}}
+           (stored (:task-id spawned))))
+    (work! app)
+    (let [retry (absurd/retry-task! app (:task-id spawned) {:spawn-new? true})]
+      (is (= {:params {:a/b 1}
+              :headers {:x/trace "abc"}}
+             (stored (:task-id retry)))))))

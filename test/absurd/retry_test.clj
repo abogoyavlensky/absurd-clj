@@ -1,6 +1,6 @@
 (ns absurd.retry-test
   (:require [absurd.core :as absurd]
-            [absurd.sql :as sql]
+            [absurd.store :as store]
             [absurd.test-helpers :as h]
             [clojure.string :as str]
             [clojure.test :refer [deftest is use-fixtures]])
@@ -181,8 +181,8 @@
         [claim] (absurd/claim-tasks! app {:worker-id "worker-1"
                                           :claim-timeout 60})]
     (absurd/cancel-task! app (:task-id spawned))
-    (let [e (try (sql/set-task-checkpoint-state! h/*conn* (:queue app) (:task-id spawned) "step-1"
-                                                 {:result "value"} (:run-id claim) 60)
+    (let [e (try (store/set-task-checkpoint-state! (:store app) (:queue app) (:task-id spawned) "step-1"
+                                                   {:result "value"} (:run-id claim) 60)
                  nil
                  (catch clojure.lang.ExceptionInfo e e))]
       (is (= :absurd/cancelled (:type (ex-data e))))

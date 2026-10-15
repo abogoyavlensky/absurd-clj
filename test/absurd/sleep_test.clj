@@ -12,7 +12,7 @@
                            :batch-size 1}))
 
 (defn- available-at ^Instant [run]
-  (.toInstant ^java.sql.Timestamp (:available-at run)))
+  (:available-at run))
 
 (deftest sleep-for-suspends-until-duration-elapses
   (let [base (Instant/parse "2024-05-05T10:00:00Z")

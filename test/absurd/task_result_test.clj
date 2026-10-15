@@ -1,10 +1,8 @@
 (ns absurd.task-result-test
   (:require [absurd.core :as absurd]
-            [absurd.sql :as sql]
+            [absurd.store :as store]
             [absurd.test-helpers :as h]
-            [clojure.test :refer [deftest is testing use-fixtures]]
-            [next.jdbc :as jdbc]
-            [next.jdbc.result-set :as rs]))
+            [clojure.test :refer [deftest is testing use-fixtures]]))
 
 (use-fixtures :each h/with-conn)
 
@@ -16,7 +14,7 @@
     (is (= {:state :pending} (absurd/fetch-task-result app (:task-id spawned))))
     (let [[claim] (absurd/claim-tasks! app {:worker-id "worker"})]
       (is (= {:state :running} (absurd/fetch-task-result app (:task-id spawned))))
-      (sql/complete-run! h/*conn* (:queue app) (:run-id claim) {:ok true}))
+      (store/complete-run! (:store app) (:queue app) (:run-id claim) {:ok true}))
     (is (= {:state :completed
             :result {:ok true}} (absurd/fetch-task-result app (:task-id spawned))))))
 
@@ -37,10 +35,10 @@
         ctx (make-context parent parent-claim 120 nil)
         child-spawned (absurd/spawn! child "child" {} {:queue (:queue child)})
         finish-child (future
-                       (with-open [conn (jdbc/get-connection (h/datasource))]
+                       (let [child-store (h/store {:db (h/datasource)})]
                          (Thread/sleep 100)
-                         (let [[claim] (sql/claim-tasks! conn (:queue child) "child-worker" 120 1)]
-                           (sql/complete-run! conn (:queue child) (:run-id claim) {:child "ok"}))))]
+                         (let [[claim] (store/claim-tasks! child-store (:queue child) "child-worker" 120 1)]
+                           (store/complete-run! child-store (:queue child) (:run-id claim) {:child "ok"}))))]
     (try
       (is (= {:state :completed
               :result {:child "ok"}}
@@ -91,8 +89,7 @@
         parent-spawned (absurd/spawn! parent "parent" {:child_id (:task-id child-spawned)})]
     (absurd/work-batch! parent {:worker-id "parent-worker"})
     (is (= 1 (h/count-checkpoints h/*conn* (:queue parent) (:task-id parent-spawned))))
-    (is (= 1 (:n (jdbc/execute-one! h/*conn* ["select absurd.cleanup_tasks(?, ?::integer, ?::integer) as n" (:queue child) 0 10]
-                                    {:builder-fn rs/as-unqualified-kebab-maps}))))
+    (is (= 1 (h/delete-task! h/*conn* (:queue child) (:task-id child-spawned))))
     (is (nil? (absurd/fetch-task-result child (:task-id child-spawned))))
     (absurd/work-batch! parent {:worker-id "parent-worker"})
     (is (= {:state :completed
@@ -111,10 +108,10 @@
         child-spawned (absurd/spawn! parent "slow-child" nil {:queue child-queue})
         parent-spawned (absurd/spawn! parent "parent" {:child_id (:task-id child-spawned)})
         slow-child (future
-                     (with-open [conn (jdbc/get-connection (h/datasource))]
-                       (let [[claim] (sql/claim-tasks! conn child-queue "child-worker" 120 1)]
-                         (Thread/sleep 3000)
-                         (sql/complete-run! conn child-queue (:run-id claim) {:child "ok"}))))]
+                     (let [child-store (h/store {:db (h/datasource)})
+                           [claim] (store/claim-tasks! child-store child-queue "child-worker" 120 1)]
+                       (Thread/sleep 3000)
+                       (store/complete-run! child-store child-queue (:run-id claim) {:child "ok"})))]
     (try
       (absurd/work-batch! parent {:worker-id "parent-worker"
                                   :claim-timeout 1})
@@ -142,16 +139,16 @@
         parent-spawned (absurd/spawn! parent "parent" {:child_id (:task-id child-spawned)})
         stop? (atom false)
         competitor (future
-                     (with-open [conn (jdbc/get-connection (h/datasource))]
+                     (let [competitor-store (h/store {:db (h/datasource)})]
                        (Thread/sleep 300)
                        (while (not @stop?)
-                         (sql/claim-tasks! conn (:queue parent) "competitor" 2 1)
+                         (store/claim-tasks! competitor-store (:queue parent) "competitor" 2 1)
                          (Thread/sleep 100))))
         child-worker (future
-                       (with-open [conn (jdbc/get-connection (h/datasource))]
-                         (let [[claim] (sql/claim-tasks! conn child-queue "child-worker" 120 1)]
-                           (Thread/sleep 2500)
-                           (sql/complete-run! conn child-queue (:run-id claim) {:child "ok"}))))]
+                       (let [child-store (h/store {:db (h/datasource)})
+                             [claim] (store/claim-tasks! child-store child-queue "child-worker" 120 1)]
+                         (Thread/sleep 2500)
+                         (store/complete-run! child-store child-queue (:run-id claim) {:child "ok"})))]
     (try
       (absurd/work-batch! parent {:worker-id "parent-worker"
                                   :claim-timeout 2})
