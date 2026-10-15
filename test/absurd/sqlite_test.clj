@@ -6,9 +6,13 @@
             [absurd.sqlite :as sqlite]
             [absurd.store :as store]
             [absurd.test-helpers :as h]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [next.jdbc :as jdbc]
-            [next.jdbc.result-set :as rs])
+            [next.jdbc.result-set :as rs]
+            [ragtime.core :as ragtime]
+            [ragtime.next-jdbc :as ragtime-jdbc]
+            [ragtime.protocols :as ragtime-protocols])
   (:import [java.io File]
            [java.sql Connection SQLException]
            [java.time Instant]
@@ -203,6 +207,25 @@
       (let [app (absurd/client {:db ds
                                 :backend :sqlite})]
         (is (= [] (absurd/list-queues app)))))))
+
+(deftest the-shipped-migration-applies-with-ragtime
+  (h/call-with-sqlite-db
+    (fn [_ds file]
+      (let [ds (jdbc/get-datasource {:jdbcUrl (str (url-of file) "?journal_mode=WAL")})
+            migrations (vec (ragtime-jdbc/load-resources "absurd/sqlite/migrations"))
+            index (ragtime/into-index migrations)
+            database (ragtime-jdbc/sql-database ds)]
+        (is (= ["001-absurd-init"] (map ragtime-protocols/id migrations)))
+        (ragtime/migrate-all database index migrations)
+        (is (= {:state :completed
+                :result {:echo {:value 1}}}
+               (run-one-task! (absurd/client {:db ds
+                                              :backend :sqlite}))))
+        (is (= [{:journal-mode "wal"}]
+               (jdbc/execute! ds ["pragma journal_mode"] {:builder-fn rs/as-unqualified-kebab-maps}))
+            "the journal_mode URL parameter put the file in WAL")
+        (ragtime/rollback-last database index)
+        (is (empty? (filter #(str/starts-with? % "absurd_") (table-names ds))))))))
 
 (deftest tables-of-the-application-in-the-same-file-are-untouched
   (h/call-with-sqlite-db
