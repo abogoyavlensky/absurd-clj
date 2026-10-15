@@ -1,14 +1,18 @@
 (ns absurd.sqlite-test
-  "SQLite-specific behaviour: client wiring, lazy schema, deployment shapes.
+  "SQLite-specific behaviour: client wiring, explicit schema, deployment shapes.
   Each test runs on its own temp-file database, so no Docker or `with-conn`
   fixture is involved."
   (:require [absurd.core :as absurd]
             [absurd.sqlite :as sqlite]
             [absurd.store :as store]
             [absurd.test-helpers :as h]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [next.jdbc :as jdbc]
-            [next.jdbc.result-set :as rs])
+            [next.jdbc.result-set :as rs]
+            [ragtime.core :as ragtime]
+            [ragtime.next-jdbc :as ragtime-jdbc]
+            [ragtime.protocols :as ragtime-protocols])
   (:import [java.io File]
            [java.sql Connection SQLException]
            [java.time Instant]
@@ -25,6 +29,14 @@
   (set (map :name (jdbc/execute! ds ["select name from sqlite_master where type = 'table'"]
                                  {:builder-fn rs/as-unqualified-kebab-maps}))))
 
+(defn- call-with-schema-db
+  "Like `h/call-with-sqlite-db`, with the Absurd schema already created."
+  [f]
+  (h/call-with-sqlite-db
+    (fn [ds file]
+      (sqlite/ensure-schema! ds)
+      (f ds file))))
+
 (defn- run-one-task!
   "Register an echo task on `app`, spawn it, work it and return its result."
   [app]
@@ -35,7 +47,7 @@
     (absurd/fetch-task-result app (:task-id spawned))))
 
 (deftest a-sqlite-url-infers-the-backend-and-runs-a-task-end-to-end
-  (h/call-with-sqlite-db
+  (call-with-schema-db
     (fn [_ds file]
       (let [app (absurd/client {:db (url-of file)})]
         (is (= :sqlite (:backend app)))
@@ -47,7 +59,7 @@
         (absurd/close! app)))))
 
 (deftest a-datasource-with-the-sqlite-backend-works
-  (h/call-with-sqlite-db
+  (call-with-schema-db
     (fn [ds _file]
       (let [app (absurd/client {:db ds
                                 :backend :sqlite})]
@@ -57,7 +69,7 @@
                (run-one-task! app)))))))
 
 (deftest a-single-shared-connection-works-from-several-threads
-  (h/call-with-sqlite-db
+  (call-with-schema-db
     (fn [ds _file]
       (with-open [^Connection conn (jdbc/get-connection ds)]
         (let [app (absurd/client {:db conn
@@ -70,7 +82,7 @@
           (is (false? (.isClosed conn)) "the client never closes a connection it was given"))))))
 
 (deftest clients-sharing-one-connection-take-turns
-  (h/call-with-sqlite-db
+  (call-with-schema-db
     (fn [ds _file]
       (with-open [^Connection conn (jdbc/get-connection ds)]
         (let [apps (mapv #(absurd/client {:db conn
@@ -101,13 +113,14 @@
     (is (= :sqlite (:backend (absurd/client {:db "jdbc:sqlite:/tmp/absurd-x.db?busy_timeout=5000"})))))
   (testing "one shared Connection to a memory database is the supported way"
     (with-open [^Connection conn (jdbc/get-connection "jdbc:sqlite::memory:")]
+      (sqlite/ensure-schema! conn)
       (is (= {:state :completed
               :result {:echo {:value 1}}}
              (run-one-task! (absurd/client {:db conn
                                             :backend :sqlite})))))))
 
 (deftest the-engine-clock-is-read-inside-the-transaction
-  (h/call-with-sqlite-db
+  (call-with-schema-db
     (fn [ds _file]
       (let [holder (atom nil)
             held? (atom [])
@@ -124,7 +137,7 @@
             "operations read the clock under the lock; current-time is not an operation")))))
 
 (deftest the-engine-clock-is-pluggable
-  (h/call-with-sqlite-db
+  (call-with-schema-db
     (fn [ds _file]
       (let [pinned (Instant/parse "2030-01-01T00:00:00.123456Z")
             app (absurd/client {:db ds
@@ -162,39 +175,28 @@
                                                                   :queue ""}))))))
 
 (defn- counting-datasource
-  "A DataSource that counts `getConnection` calls and fails the first
-  `failures` of them."
-  [^DataSource delegate calls failures]
+  "A DataSource that counts `getConnection` calls."
+  [^DataSource delegate calls]
   (reify DataSource
     (getConnection [_]
-      (when (<= (swap! calls inc) failures)
-        (throw (SQLException. "database is unavailable")))
+      (swap! calls inc)
       (.getConnection delegate))))
 
-(deftest the-constructor-never-connects-and-the-schema-is-created-lazily
+(deftest operations-need-an-explicit-schema
   (h/call-with-sqlite-db
     (fn [ds _file]
       (let [calls (atom 0)
-            app (absurd/client {:db (counting-datasource ds calls 0)
+            app (absurd/client {:db (counting-datasource ds calls)
                                 :backend :sqlite})]
         (is (zero? @calls) "the constructor does not touch the database")
-        (is (empty? (table-names ds)))
-        (is (= [] (absurd/list-queues app)))
-        (is (pos? @calls))
-        (is (contains? (table-names ds) "absurd_tasks") "the first operation created the schema")
-        (let [before @calls]
-          (absurd/list-queues app)
-          (is (= (inc before) @calls) "later operations borrow one connection and skip the schema"))))))
-
-(deftest a-failed-first-operation-is-retried
-  (h/call-with-sqlite-db
-    (fn [ds _file]
-      (let [calls (atom 0)
-            app (absurd/client {:db (counting-datasource ds calls 1)
-                                :backend :sqlite})]
-        (is (thrown-with-msg? SQLException #"database is unavailable" (absurd/list-queues app)))
-        (is (= [] (absurd/list-queues app)) "the store recovers once the database is back")
-        (is (contains? (table-names ds) "absurd_tasks"))))))
+        (is (= :absurd/schema-missing (h/ex-type #(absurd/list-queues app))))
+        (absurd/register-task! app "t" (fn [_params _ctx] nil))
+        (is (= :absurd/schema-missing (h/ex-type #(absurd/spawn! app "t" {}))))
+        (is (instance? SQLException (ex-cause (try (absurd/list-queues app) (catch Exception e e))))
+            "the driver error is kept as the cause")
+        (is (empty? (table-names ds)) "no operation created the schema")
+        (sqlite/ensure-schema! ds)
+        (is (= [] (absurd/list-queues app)))))))
 
 (deftest ensure-schema-can-run-at-boot-and-is-repeatable
   (h/call-with-sqlite-db
@@ -206,11 +208,31 @@
                                 :backend :sqlite})]
         (is (= [] (absurd/list-queues app)))))))
 
+(deftest the-shipped-migration-applies-with-ragtime
+  (h/call-with-sqlite-db
+    (fn [_ds file]
+      (let [ds (jdbc/get-datasource {:jdbcUrl (str (url-of file) "?journal_mode=WAL")})
+            migrations (vec (ragtime-jdbc/load-resources "absurd/sqlite/migrations"))
+            index (ragtime/into-index migrations)
+            database (ragtime-jdbc/sql-database ds)]
+        (is (= ["001-absurd-init"] (map ragtime-protocols/id migrations)))
+        (ragtime/migrate-all database index migrations)
+        (is (= {:state :completed
+                :result {:echo {:value 1}}}
+               (run-one-task! (absurd/client {:db ds
+                                              :backend :sqlite}))))
+        (is (= [{:journal-mode "wal"}]
+               (jdbc/execute! ds ["pragma journal_mode"] {:builder-fn rs/as-unqualified-kebab-maps}))
+            "the journal_mode URL parameter put the file in WAL")
+        (ragtime/rollback-last database index)
+        (is (empty? (filter #(str/starts-with? % "absurd_") (table-names ds))))))))
+
 (deftest tables-of-the-application-in-the-same-file-are-untouched
   (h/call-with-sqlite-db
     (fn [ds _file]
       (jdbc/execute! ds ["create table app_items (id integer primary key, name text)"])
       (jdbc/execute! ds ["insert into app_items (name) values ('keep me')"])
+      (sqlite/ensure-schema! ds)
       (let [app (absurd/client {:db ds
                                 :backend :sqlite})]
         (is (= {:state :completed
@@ -225,7 +247,7 @@
                             {:builder-fn rs/as-unqualified-kebab-maps}))))))
 
 (deftest sqlite-errors-surface-like-the-postgres-ones
-  (h/call-with-sqlite-db
+  (call-with-schema-db
     (fn [ds _file]
       (let [app (absurd/client {:db ds
                                 :backend :sqlite})]
@@ -284,7 +306,7 @@
     (into [] (mapcat deref) futures)))
 
 (deftest concurrent-workers-complete-every-task-exactly-once
-  (h/call-with-sqlite-db
+  (call-with-schema-db
     (fn [ds _file]
       (let [app (absurd/client {:db ds
                                 :backend :sqlite
@@ -313,7 +335,7 @@
             (is (zero? (count-where ds "select count(*) as n from absurd_runs where state <> 'completed'")))))))))
 
 (deftest steps-run-once-per-task-under-concurrency
-  (h/call-with-sqlite-db
+  (call-with-schema-db
     (fn [ds _file]
       (let [app (absurd/client {:db ds
                                 :backend :sqlite

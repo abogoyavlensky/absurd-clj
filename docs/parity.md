@@ -27,7 +27,7 @@ one backend are guarded with `h/only`:
   `absurd.schema-test/sqlite-schema-version-is-recorded`.
 - SQLite engine and deployment tests: `absurd.sqlite.engine-test/*` (each ported
   procedure against Postgres semantics), and `absurd.sqlite-test/*` (client wiring,
-  lazy schema, single connection, in-memory URLs and the concurrency tests with 4
+  explicit schema and the ragtime migration, single connection, in-memory URLs and the concurrency tests with 4
   worker threads and 200 tasks).
 
 ## test_absurd.py

@@ -100,15 +100,41 @@ has no compile-time dependency on it, so Postgres users never download it:
 (def app (absurd/client {:db datasource :backend :sqlite}))
 ```
 
-The schema (`absurd_*` tables, so they can live in your application's own
-database file) is created on the first operation, and the database is switched
-to WAL journaling. The client still never connects in its constructor. To create
-the schema at boot instead, call `ensure-schema!`:
+The app creates the schema (`absurd_*` tables, so they can live in your
+application's own database file) explicitly, before the first operation. The
+library never creates it on its own, and the client constructor never connects.
+Operations on a database without the schema throw `:absurd/schema-missing`.
+Pick one of two ways:
 
-```clojure
-(require '[absurd.sqlite :as sqlite])
-(sqlite/ensure-schema! datasource)
-```
+1. Call `ensure-schema!` at boot. It creates the tables when missing, switches
+   the file to WAL journaling, checks the schema version, and is safe to call
+   on every start:
+
+   ```clojure
+   (require '[absurd.sqlite :as sqlite])
+   (sqlite/ensure-schema! datasource)
+   ```
+
+2. Apply the migration with your own migration tool. The library ships
+   `absurd/sqlite/migrations/001-absurd-init.up.sql` and `.down.sql` on the
+   classpath. With ragtime, load them next to your own migrations (the
+   migration ID is `001-absurd-init`):
+
+   ```clojure
+   (ragtime.repl/migrate
+     {:datastore (ragtime.next-jdbc/sql-database ds)
+      :migrations (concat (ragtime.next-jdbc/load-resources "absurd/sqlite/migrations")
+                          (ragtime.next-jdbc/load-resources "migrations"))})
+   ```
+
+   With migratus or Flyway, copy the file into your migrations directory under
+   your own name (migratus identifies migrations by their numeric prefix, so
+   `001` would clash with your first migration). A migration runs in a
+   transaction and cannot switch the journal mode, so set WAL on the
+   connection: `jdbc:sqlite:app.db?journal_mode=WAL`. WAL is not required for
+   correctness, but it lets reads run alongside a write.
+
+Future schema versions ship as new numbered files; `001` never changes.
 
 Each operation is one SQLite transaction (`BEGIN IMMEDIATE` for writes). Every
 operation over the same `DataSource` or `Connection` object takes one
@@ -312,6 +338,7 @@ All SDK errors are `ex-info` with a `:type` key:
 | `:absurd/invalid-queue-name`    | Empty or longer than 57 bytes                        |
 | `:absurd/invalid-db`            | Unsupported `:db` value, or SQLite without `:db` or with an in-memory URL |
 | `:absurd/invalid-backend`       | `:backend` is neither `:postgres` nor `:sqlite`      |
+| `:absurd/schema-missing`        | SQLite operation on a database without the schema    |
 | `:absurd/schema-version-mismatch` | A SQLite file written by another schema version    |
 | `:absurd/queue-mismatch`        | Spawn asked for a queue other than the registered one |
 | `:absurd/unregistered-task`     | Spawn of an unknown task without `:queue`            |

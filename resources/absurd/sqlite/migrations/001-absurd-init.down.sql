@@ -1,0 +1,13 @@
+drop table if exists absurd_waits;
+--;;
+drop table if exists absurd_events;
+--;;
+drop table if exists absurd_checkpoints;
+--;;
+drop table if exists absurd_runs;
+--;;
+drop table if exists absurd_tasks;
+--;;
+drop table if exists absurd_queues;
+--;;
+drop table if exists absurd_meta;

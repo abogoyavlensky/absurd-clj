@@ -28,12 +28,15 @@ Targets Absurd schema version 0.5.0.
   `absurd.sqlite.schema`): the Absurd procedures ported to Clojure behind the
   `Store` protocol, for single-process apps that want durable execution with one
   database file. Select it with `:db "jdbc:sqlite:..."` or `:backend :sqlite`;
-  `ensure-schema!` creates the schema eagerly. Needs `org.xerial/sqlite-jdbc` on
-  the classpath. No partitioned queues, queue policy intervals are stored
-  verbatim, and finished tasks are not cleaned up yet.
+  the schema is created explicitly with `ensure-schema!` or by applying the
+  shipped migration `absurd/sqlite/migrations/001-absurd-init.up.sql` with your
+  own migration tool; operations without it throw `:absurd/schema-missing`.
+  Needs `org.xerial/sqlite-jdbc` on the classpath. No partitioned queues,
+  queue policy intervals are stored verbatim, and finished tasks are not
+  cleaned up yet.
 - `absurd.core/client` options `:backend` and `:db-now-fn`, and the client map
-  keys `:store` and `:backend`. New error types `:absurd/invalid-backend` and
-  `:absurd/schema-version-mismatch`.
+  keys `:store` and `:backend`. New error types `:absurd/invalid-backend`,
+  `:absurd/schema-missing` and `:absurd/schema-version-mismatch`.
 - `absurd.json`: jsonista codec with keyword keys and jsonb helpers.
 - Test suite ported from the Python SDK (see `docs/parity.md`), a replay
   determinism property test, and a cross-SDK check against the Python SDK
