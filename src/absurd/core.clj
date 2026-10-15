@@ -123,6 +123,10 @@
         (sqlite-url? db) (jdbc/get-datasource {:jdbcUrl db})
         :else (invalid-db))
 
+      (sqlite-url? db)
+      (fail "A jdbc:sqlite: URL needs the SQLite backend; drop :backend or pass :backend :sqlite"
+            :absurd/invalid-db {:db db})
+
       (nil? db) (jdbc/get-datasource (->jdbc-url (resolve-database-url)))
       (string? db) (jdbc/get-datasource (->jdbc-url db))
       :else (invalid-db))))

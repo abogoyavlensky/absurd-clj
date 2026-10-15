@@ -62,45 +62,55 @@
 
 ;; Transactions
 
-(deftest with-tx-commits-on-success
+(deftest run-tx-commits-on-success
   (schema/ensure-schema! *env*)
-  (is (= :done (engine/with-tx [conn *env*]
-                 (jdbc/execute! conn ["insert into absurd_meta (key, value) values ('k', 'v')"])
-                 :done)))
+  (is (= :done (engine/run-tx *env* :write
+                              (fn [conn]
+                                (jdbc/execute! conn ["insert into absurd_meta (key, value) values ('k', 'v')"])
+                                :done))))
   (is (= [{:value "v"}] (query "select value from absurd_meta where key = 'k'"))))
 
-(deftest with-tx-rolls-back-when-the-body-throws
+(deftest run-tx-rolls-back-when-the-body-throws
   (schema/ensure-schema! *env*)
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boom"
-                        (engine/with-tx [conn *env*]
-                          (jdbc/execute! conn ["insert into absurd_meta (key, value) values ('k', 'v')"])
-                          (throw (ex-info "boom" {})))))
+                        (engine/run-tx *env* :write
+                                       (fn [conn]
+                                         (jdbc/execute! conn ["insert into absurd_meta (key, value) values ('k', 'v')"])
+                                         (throw (ex-info "boom" {}))))))
   (is (empty? (query "select value from absurd_meta where key = 'k'")))
   (testing "the lock is released and the next transaction works"
-    (is (= 1 (engine/with-tx [_ *env*] 1)))))
+    (is (= 1 (engine/run-tx *env* :write (constantly 1))))))
 
-(deftest with-read-tx-runs-a-deferred-transaction
+(deftest run-tx-read-mode-runs-a-deferred-transaction
   (schema/ensure-schema! *env*)
-  (is (= [{:n 1}] (engine/with-read-tx [conn *env*]
-                    (jdbc/execute! conn ["select count(*) as n from absurd_meta"]
-                                   {:builder-fn rs/as-unqualified-kebab-maps})))))
+  (is (= [{:n 1}] (engine/run-tx *env* :read
+                                 #(jdbc/execute! % ["select count(*) as n from absurd_meta"]
+                                                 {:builder-fn rs/as-unqualified-kebab-maps})))))
 
-(deftest with-tx-rejects-a-connection-with-autocommit-off
+(deftest run-tx-rejects-a-connection-with-autocommit-off
   (with-open [conn (jdbc/get-connection *ds*)]
     (.setAutoCommit conn false)
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"autocommit"
-                          (engine/with-tx [_ {:connectable conn
-                                              :lock (ReentrantLock.)}]
-                            :unreachable)))))
+                          (engine/run-tx {:connectable conn
+                                          :lock (ReentrantLock.)}
+                                         :write
+                                         (constantly :unreachable))))))
 
-(deftest with-tx-uses-a-given-connection-without-closing-it
+(deftest run-tx-uses-a-given-connection-without-closing-it
   (schema/ensure-schema! *env*)
   (with-open [conn (jdbc/get-connection *ds*)]
     (let [env {:connectable conn
                :lock (ReentrantLock.)}]
-      (engine/with-tx [c env] (jdbc/execute! c ["insert into absurd_meta (key, value) values ('a', '1')"]))
-      (engine/with-tx [c env] (jdbc/execute! c ["insert into absurd_meta (key, value) values ('b', '2')"]))
+      (engine/run-tx env :write #(jdbc/execute! % ["insert into absurd_meta (key, value) values ('a', '1')"]))
+      (engine/run-tx env :write #(jdbc/execute! % ["insert into absurd_meta (key, value) values ('b', '2')"]))
       (is (false? (.isClosed conn))))))
+
+(deftest lock-for-is-shared-per-connectable
+  (with-open [a (jdbc/get-connection *ds*)
+              b (jdbc/get-connection *ds*)]
+    (is (identical? (engine/lock-for a) (engine/lock-for a)))
+    (is (not (identical? (engine/lock-for a) (engine/lock-for b))))
+    (is (identical? (engine/lock-for *ds*) (engine/lock-for *ds*)))))
 
 ;; Helpers
 
@@ -589,6 +599,19 @@
            (select-keys (task-row (:task-id delayed)) [:state :cancelled-at])))
     (is (= "cancelled" (:state (run-row (:run-id delayed)))))))
 
+(deftest claim-tasks-casts-cancellation-limits-like-postgres
+  (setup!)
+  (testing "an integer in a JSON string is accepted, as by ::bigint"
+    (let [delayed (spawn! t0 {"cancellation" {"max_delay" "60"}})]
+      (delay-run! (:run-id delayed) (+ t0 1000000))
+      (claim! (+ t0 60000))
+      (is (= "cancelled" (:state (task-row (:task-id delayed)))))))
+  (testing "anything else aborts the claim instead of cancelling at once"
+    (spawn! t0 {"cancellation" {"max_delay" "soon"}})
+    (let [e (exception-of #(claim! t0))]
+      (is (= "22P02" (.getSQLState e)))
+      (is (= "invalid input syntax for type bigint: \"soon\"" (ex-message e))))))
+
 (deftest claim-tasks-applies-max-duration-to-a-running-task
   (setup!)
   (let [timed (spawn! t0 {"cancellation" {"max_duration" 10}})]
@@ -768,7 +791,9 @@
     (tx #(engine/extend-claim % (+ t0 4000) "q" run-id 30))
     (is (= (+ t0 4000 30000) (:claim-expires-at (run-row run-id))))
     (is (= "extend_by must be > 0" (message #(tx (fn [c] (engine/extend-claim c t0 "q" run-id 0))))))
-    (is (= "extend_by must be > 0" (message #(tx (fn [c] (engine/extend-claim c t0 "q" run-id nil))))))
+    (is (= "extend_by must be > 0" (message #(tx (fn [c]
+                                                   #_{:clj-kondo/ignore [:type-mismatch]}
+                                                   (engine/extend-claim c t0 "q" run-id nil))))))
     (let [unknown (str (random-uuid))]
       (is (= (str "Run \"" unknown "\" not found in queue \"q\"")
              (message #(tx (fn [c] (engine/extend-claim c t0 "q" unknown 5)))))))

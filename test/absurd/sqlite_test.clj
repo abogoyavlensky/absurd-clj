@@ -69,6 +69,29 @@
             (is (= 20 (count (set (map :task-id spawned))))))
           (is (false? (.isClosed conn)) "the client never closes a connection it was given"))))))
 
+(deftest clients-sharing-one-connection-take-turns
+  (h/call-with-sqlite-db
+    (fn [ds _file]
+      (with-open [^Connection conn (jdbc/get-connection ds)]
+        (let [apps (mapv #(absurd/client {:db conn
+                                          :backend :sqlite
+                                          :queue %})
+                         ["q1" "q2"])
+              spawn-all (fn [app]
+                          (future
+                            (dotimes [i 100]
+                              (absurd/spawn! app "t" {:i i} {:queue (:queue app)}))))]
+          (run! absurd/create-queue! apps)
+          ;; deref rethrows a failed spawn, e.g. a transaction started inside another
+          (run! deref (mapv spawn-all apps))
+          (is (= [{:queue-name "q1"
+                   :n 100}
+                  {:queue-name "q2"
+                   :n 100}]
+                 (jdbc/execute! conn ["select queue_name, count(*) as n from absurd_tasks
+                                        group by queue_name order by queue_name"]
+                                {:builder-fn rs/as-unqualified-kebab-maps}))))))))
+
 (deftest in-memory-urls-are-rejected-but-a-memory-connection-works
   (doseq [url ["jdbc:sqlite::memory:" "jdbc:sqlite:" "jdbc:sqlite:file::memory:?cache=private"
                "jdbc:sqlite:file:x?mode=memory"]]
@@ -126,6 +149,9 @@
                                                                :backend :mysql}))))
     (is (= :absurd/invalid-backend (h/ex-type #(absurd/client {:db "jdbc:sqlite:x.db"
                                                                :backend "sqlite"})))))
+  (testing "a SQLite URL cannot be forced onto the Postgres backend"
+    (is (= :absurd/invalid-db (h/ex-type #(absurd/client {:db "jdbc:sqlite:x.db"
+                                                          :backend :postgres})))))
   (testing "SQLite takes a jdbc:sqlite: URL, a DataSource or a Connection"
     (is (= :absurd/invalid-db (h/ex-type #(absurd/client {:db "postgresql://localhost/x"
                                                           :backend :sqlite}))))

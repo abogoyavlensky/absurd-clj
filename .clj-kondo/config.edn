@@ -1,5 +1,3 @@
 {:linters {:single-key-in {:level :warning}
            :shadowed-var {:level :warning}
-           :refer-all {:exclude [clojure.test]}}
- :lint-as {absurd.sqlite.engine/with-tx clojure.core/let
-           absurd.sqlite.engine/with-read-tx clojure.core/let}}
+           :refer-all {:exclude [clojure.test]}}}

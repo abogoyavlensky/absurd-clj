@@ -4,7 +4,7 @@
   Every procedure is a function over a transaction-scoped connection:
   `(f conn now queue ...)`, where `now` is the engine clock as epoch
   milliseconds, read once per operation the way each PL/pgSQL function reads
-  `absurd.current_time()` into `v_now`. Run them inside `with-tx`.
+  `absurd.current_time()` into `v_now`. Run them inside `run-tx`.
 
   Values are stored the way the design describes: timestamps as epoch
   milliseconds (`infinity` for Postgres' `'infinity'`), JSON as text, UUIDs as
@@ -15,14 +15,17 @@
   is AB001, AB002, AB003 or P0001."
   (:require [absurd.json :as json]
             [clojure.string :as str]
+            [jsonista.core :as jsonista]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs])
   (:import [java.nio.charset StandardCharsets]
            [java.security SecureRandom]
            [java.sql Connection SQLException Statement]
            [java.time Instant]
+           [java.util Collections Map WeakHashMap]
            [java.util.concurrent.atomic AtomicLong]
            [java.util.concurrent.locks ReentrantLock]
+           [java.util.function Function]
            [javax.sql DataSource]))
 
 ;; Errors
@@ -60,6 +63,15 @@
   "Decode a JSON column. SQL NULL and the JSON text `null` both give nil."
   [s]
   (some-> s json/read-str))
+
+(def ^:private string-key-mapper (jsonista/object-mapper {}))
+
+(defn- decode-json-as-written
+  "Decode a JSON column keeping object keys as strings, so re-encoding gives
+  back the same keys. `decode-json` turns \"x/trace\" into `:x/trace`, which
+  encodes as \"trace\"."
+  [s]
+  (some-> s (jsonista/read-value string-key-mapper)))
 
 ;; UUIDs
 
@@ -217,13 +229,26 @@
         (throw t)))
     result))
 
+(defonce ^:private ^Map locks
+  (Collections/synchronizedMap (WeakHashMap.)))
+
+(defn lock-for
+  "The in-process lock of `connectable`, created on first use. Every store over
+  the same DataSource or Connection object gets the same lock, so clients that
+  share a Connection never start a transaction inside another one's. Entries
+  go away with the connectable."
+  ^ReentrantLock [connectable]
+  (.computeIfAbsent locks connectable (reify Function
+                                        (apply [_ _] (ReentrantLock.)))))
+
 (defn call-with-connection
   "Run `(f conn)` with exclusive use of the environment's connection.
 
   `env` is `{:connectable c :lock l}`. `c` is a DataSource (a connection is
   borrowed and closed afterwards) or a Connection (used as is, never closed).
-  The in-process `ReentrantLock` serializes operations from threads that share
-  the environment, which is what makes one shared Connection safe."
+  The in-process `ReentrantLock` (see `lock-for`) serializes operations from
+  every thread and client over `c`, which is what makes one shared Connection
+  safe."
   [{:keys [connectable ^ReentrantLock lock]} f]
   (.lock lock)
   (try
@@ -237,23 +262,10 @@
       (.unlock lock))))
 
 (defn run-tx
-  "Run `(f conn)` in a transaction on the environment's connection. See
-  `call-with-connection` and `call-in-tx`."
+  "Run `(f conn)` in a transaction of `mode` (`:write` or `:read`) on the
+  environment's connection. See `call-with-connection` and `call-in-tx`."
   [env mode f]
   (call-with-connection env #(call-in-tx % mode f)))
-
-(defmacro with-tx
-  "Run `body` with `conn` bound to the environment's connection inside a write
-  transaction (`BEGIN IMMEDIATE`):
-
-      (with-tx [conn env] ...)"
-  [[conn env] & body]
-  `(run-tx ~env :write (fn [~conn] ~@body)))
-
-(defmacro with-read-tx
-  "Like `with-tx`, for operations that only read (a deferred `BEGIN`)."
-  [[conn env] & body]
-  `(run-tx ~env :read (fn [~conn] ~@body)))
 
 ;; Shared helpers for the procedures
 
@@ -264,11 +276,16 @@
   (json/round-trip v))
 
 (defn- opt-json
-  "The JSON text of `k` in `options`, or SQL NULL (nil) when the key is
-  absent, like `p_options->'k'`."
+  "The JSON text of option `k` (a keyword) as the caller wrote it, under a
+  string or keyword key, or SQL NULL (nil) when absent, like `p_options->'k'`.
+  It reads the caller's map, not the normalized one, so keys inside the value
+  such as \"x/trace\" are stored unchanged."
   [options k]
-  (when (contains? options k)
-    (encode-json (get options k))))
+  (when (map? options)
+    (let [s (name k)]
+      (cond
+        (contains? options s) (encode-json (get options s))
+        (contains? options k) (encode-json (get options k))))))
 
 (defn- uuid-text
   "A canonical lower-case UUID string, or raise like a `::uuid` cast."
@@ -445,7 +462,8 @@
   [conn now queue task-name params options]
   (when (or (nil? task-name) (str/blank? task-name))
     (raise! "task_name must be provided"))
-  (let [options (let [o (normalize options)] (if (map? o) o {}))
+  (let [raw-options options
+        options (let [o (normalize options)] (if (map? o) o {}))
         ;; An explicit JSON null is not an absent key: Postgres validates it
         ;; and raises, so the two must stay distinct.
         _ (when (and (contains? options :retry_strategy) (nil? (:retry_strategy options)))
@@ -460,8 +478,8 @@
         task-id (uuidv7 now)
         run-id (uuidv7 now)
         task-params [queue task-id task-name (encode-json params)
-                     (opt-json options :headers) (opt-json options :retry_strategy)
-                     max-attempts (opt-json options :cancellation) now run-id idempotency-key]
+                     (opt-json raw-options :headers) (opt-json raw-options :retry_strategy)
+                     max-attempts (opt-json raw-options :cancellation) now run-id idempotency-key]
         inserted? (if idempotency-key
                     (pos? (update! conn (into [(str insert-task-sql
                                                     " on conflict (queue_name, idempotency_key) do nothing")]
@@ -654,22 +672,31 @@
 
 ;; Claiming
 
+(defn- cancellation-limit-ms
+  "A cancellation limit in milliseconds, cast like `(cancellation->>'k')::bigint`:
+  nil when absent, an error for anything but an integer."
+  [cancellation k]
+  (when (map? cancellation)
+    (some-> (bigint-text (get cancellation k)) (*' 1000))))
+
 (defn- cancel-overdue-tasks!
   "Apply `max_delay` (task never started) and `max_duration` (task started)
   cancellation rules, using `cancel-task` so the run and task stay in step."
   [conn now queue]
-  (doseq [{:keys [task-id]}
-          (query conn ["select task_id from absurd_tasks
+  (doseq [{:keys [task-id cancellation enqueue-at first-started-at]}
+          (query conn ["select task_id, cancellation, enqueue_at, first_started_at
+                          from absurd_tasks
                          where queue_name = ?
                            and state in ('pending', 'sleeping', 'running')
                            and cancellation is not null
-                           and ((json_extract(cancellation, '$.max_delay') is not null
-                                 and first_started_at is null
-                                 and ? - enqueue_at >= json_extract(cancellation, '$.max_delay') * 1000)
-                             or (json_extract(cancellation, '$.max_duration') is not null
-                                 and first_started_at is not null
-                                 and ? - first_started_at >= json_extract(cancellation, '$.max_duration') * 1000))
-                         order by task_id" queue now now])]
+                         order by task_id" queue])
+          :let [cancellation (decode-json cancellation)
+                max-delay (cancellation-limit-ms cancellation :max_delay)
+                max-duration (cancellation-limit-ms cancellation :max_duration)]
+          :when (or (and max-delay (nil? first-started-at)
+                         (>= (- now enqueue-at) max-delay))
+                    (and max-duration first-started-at
+                         (>= (- now first-started-at) max-duration)))]
     (cancel-task conn now queue task-id)))
 
 (defn- fail-expired-leases!
@@ -773,11 +800,12 @@
     (when (not= "failed" (:state task))
       (raise! (str "Task \"" task-id "\" is not currently failed in queue \"" queue "\"")))
     (if spawn-new?
-      (spawn-task conn now queue (:task-name task) (decode-json (:params task))
-                  (strip-nils {:headers (decode-json (:headers task))
-                               :retry_strategy (decode-json (:retry-strategy task))
-                               :max_attempts (or requested (:max-attempts task))
-                               :cancellation (decode-json (:cancellation task))}))
+      ;; Decoded with string keys: keyword keys would re-encode "x/trace" as "trace".
+      (spawn-task conn now queue (:task-name task) (decode-json-as-written (:params task))
+                  (strip-nils {"headers" (decode-json-as-written (:headers task))
+                               "retry_strategy" (decode-json-as-written (:retry-strategy task))
+                               "max_attempts" (or requested (:max-attempts task))
+                               "cancellation" (decode-json-as-written (:cancellation task))}))
       (let [attempts (:attempts task)
             max-attempts (or requested (inc (or (:max-attempts task) attempts)))]
         (when (<= max-attempts attempts)

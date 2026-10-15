@@ -13,8 +13,7 @@
             [absurd.sqlite.engine :as engine]
             [absurd.sqlite.schema :as schema]
             [absurd.store :as store])
-  (:import [java.time Instant]
-           [java.util.concurrent.locks ReentrantLock]))
+  (:import [java.time Instant]))
 
 (defn ensure-schema!
   "Create the Absurd tables in the database behind `connectable` (a DataSource
@@ -22,7 +21,7 @@
   check the stored schema version. Safe to call repeatedly."
   [connectable]
   (schema/ensure-schema! {:connectable connectable
-                          :lock (ReentrantLock.)}))
+                          :lock (engine/lock-for connectable)}))
 
 (defn- now-ms
   "The engine clock as epoch milliseconds."
@@ -97,10 +96,12 @@
 
 (defn store
   "A `Store` over a SQLite DataSource or Connection. A DataSource lends a
-  connection per operation; a Connection (autocommit on) is shared and every
-  operation takes the store's lock. Options: `:db-now-fn`, the engine clock
-  (default `Instant/now`), which plays the role of `absurd.current_time()`."
+  connection per operation; a Connection (autocommit on) is shared. Every
+  operation takes the in-process lock of the connectable, which all stores
+  over the same object share (see `absurd.sqlite.engine/lock-for`). Options:
+  `:db-now-fn`, the engine clock (default `Instant/now`), which plays the role
+  of `absurd.current_time()`."
   ([connectable] (store connectable {}))
   ([connectable {:keys [db-now-fn]
                  :or {db-now-fn #(Instant/now)}}]
-   (->SqliteStore connectable (ReentrantLock.) db-now-fn (atom false))))
+   (->SqliteStore connectable (engine/lock-for connectable) db-now-fn (atom false))))

@@ -108,9 +108,10 @@ the schema at boot instead, call `ensure-schema!`:
 (sqlite/ensure-schema! datasource)
 ```
 
-Each operation is one SQLite transaction (`BEGIN IMMEDIATE` for writes), so
-workers and request threads that share a client are serialized by an in-process
-lock, and a single shared `Connection` is safe. Run **one process writing to the
+Each operation is one SQLite transaction (`BEGIN IMMEDIATE` for writes). Every
+operation over the same `DataSource` or `Connection` object takes one
+in-process lock, so workers, request threads and several clients (say, one per
+queue) can share a single `Connection` safely. Run **one process writing to the
 database file**, with any number of threads. Several processes work too but
 contend for SQLite's write lock (waiting up to the driver's `busy_timeout`,
 3 s by default); that setup is not tested.

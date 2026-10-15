@@ -262,3 +262,18 @@
       (is (= "failed" (:state (h/get-task h/*conn* (:queue app) (:task-id spawned)))))
       (is (= "pending" (:state (h/get-task h/*conn* (:queue app) (:task-id retry)))))
       (is (= 0 (h/count-checkpoints h/*conn* (:queue app) (:task-id retry)))))))
+
+(deftest keys-with-a-slash-survive-spawn-and-retry-spawn-new
+  (let [app (-> (h/test-client)
+                (absurd/register-task! "slash-keys" (fn [_ _] (throw (ex-info "boom" {})))
+                                       {:max-attempts 1}))
+        spawned (absurd/spawn! app "slash-keys" {"a/b" 1} {:headers {"x/trace" "abc"}})
+        stored (fn [task-id] (select-keys (h/get-task h/*conn* (:queue app) task-id) [:params :headers]))]
+    (is (= {:params {:a/b 1}
+            :headers {:x/trace "abc"}}
+           (stored (:task-id spawned))))
+    (work! app)
+    (let [retry (absurd/retry-task! app (:task-id spawned) {:spawn-new? true})]
+      (is (= {:params {:a/b 1}
+              :headers {:x/trace "abc"}}
+             (stored (:task-id retry)))))))
