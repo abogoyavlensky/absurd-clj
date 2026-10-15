@@ -12,6 +12,7 @@
   JSON columns decoded, UUIDs as strings and timestamps as `Instant`."
   (:require [absurd.core :as absurd]
             [absurd.json :as absurd-json]
+            [absurd.sqlite :as sqlite]
             [absurd.sqlite.engine :as sqlite-engine]
             [clojure.string :as str]
             [clojure.test :refer [testing]]
@@ -108,6 +109,7 @@
   [f]
   (call-with-sqlite-db
     (fn [ds _file]
+      (sqlite/ensure-schema! ds)
       (binding [*backend* :sqlite
                 *conn* ds
                 *db-now* (atom nil)]

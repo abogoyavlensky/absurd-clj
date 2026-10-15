@@ -7,18 +7,25 @@
   with `store`. The library has no compile-time dependency on the driver: add
   `org.xerial/sqlite-jdbc` to your own dependencies.
 
-  The schema is created on the first operation. Call `ensure-schema!` at boot
-  to create it eagerly."
+  The library never creates the schema on its own. Create it explicitly: call
+  `ensure-schema!` at boot, or apply the migration
+  `absurd/sqlite/migrations/001-absurd-init.up.sql` (shipped on the classpath)
+  with your own migration tool. Operations on a database without the schema
+  throw `:absurd/schema-missing`."
   (:require [absurd.sql :as sql]
             [absurd.sqlite.engine :as engine]
             [absurd.sqlite.schema :as schema]
             [absurd.store :as store])
-  (:import [java.time Instant]))
+  (:import [java.sql SQLException]
+           [java.time Instant]))
 
 (defn ensure-schema!
   "Create the Absurd tables in the database behind `connectable` (a DataSource
   or a Connection with autocommit on) when missing, enable WAL journaling and
-  check the stored schema version. Safe to call repeatedly."
+  check the stored schema version. Safe to call repeatedly; call it at boot,
+  or apply `absurd/sqlite/migrations/001-absurd-init.up.sql` with a migration
+  tool instead. Operations on a database without the schema throw
+  `:absurd/schema-missing`."
   [connectable]
   (schema/ensure-schema! {:connectable connectable
                           :lock (engine/lock-for connectable)}))
@@ -28,15 +35,20 @@
   ^long [now-fn]
   (.toEpochMilli ^Instant (now-fn)))
 
-(defn- ensure-ready!
-  "Create the schema once per store. Unlike a `delay`, a failed attempt (say,
-  a locked database at boot) is retried by the next operation."
-  [{:keys [connectable lock]
-    ready :schema}]
-  (when-not @ready
-    (schema/ensure-schema! {:connectable connectable
-                            :lock lock})
-    (reset! ready true)))
+(def ^:private schema-missing-message
+  (str "The absurd SQLite schema is missing; call absurd.sqlite/ensure-schema! at boot or apply the migration "
+       schema/migration-resource))
+
+(defn- run-engine
+  "Run the engine transaction, mapping sqlite-jdbc's missing-table error to
+  `:absurd/schema-missing`. Other exceptions pass through unchanged."
+  [this mode f]
+  (try
+    (engine/run-tx this mode f)
+    (catch SQLException e
+      (if (some->> (ex-message e) (re-find #"no such table: absurd_"))
+        (throw (ex-info schema-missing-message {:type :absurd/schema-missing} e))
+        (throw e)))))
 
 (defn- run
   "Run `(f conn now)` in a transaction of `mode`, with AB001 and AB002 mapped
@@ -44,11 +56,10 @@
   after the store lock, the connection and SQLite's write lock are held, so a
   queued operation never works with a stale timestamp."
   [this mode f]
-  (ensure-ready! this)
   (sql/with-task-state-errors
-    (engine/run-tx this mode #(f % (now-ms (:now-fn this))))))
+    (run-engine this mode #(f % (now-ms (:now-fn this))))))
 
-(defrecord SqliteStore [connectable lock now-fn schema]
+(defrecord SqliteStore [connectable lock now-fn]
   store/Store
   (create-queue! [this queue storage-mode]
     (run this :write #(engine/create-queue %1 %2 queue storage-mode)))
@@ -104,4 +115,4 @@
   ([connectable] (store connectable {}))
   ([connectable {:keys [db-now-fn]
                  :or {db-now-fn #(Instant/now)}}]
-   (->SqliteStore connectable (engine/lock-for connectable) db-now-fn (atom false))))
+   (->SqliteStore connectable (engine/lock-for connectable) db-now-fn)))
