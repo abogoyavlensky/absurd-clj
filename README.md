@@ -81,7 +81,9 @@ URL is used as is.
 The same API runs on SQLite. Absurd's engine lives in Postgres stored
 procedures; for SQLite this library ports them to Clojure (`absurd.sqlite.engine`)
 behind the `absurd.store/Store` protocol, and the Postgres test suite runs
-against both backends.
+against both backends. The idea follows Simon Willison's
+[Absurd in SQLite](https://simonwillison.net/2025/Nov/12/absurd-in-sqlite/)
+proof of concept.
 
 Add the driver yourself, the same way you add a connection pool. The library
 has no compile-time dependency on it, so Postgres users never download it:
